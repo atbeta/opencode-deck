@@ -4,7 +4,7 @@ import time
 from typing import Any
 
 from .opencode_client import OpenCodeClient
-from .session_status import BUSY, IDLE, RETRY, messages_indicate_busy, normalize_session_status
+from .session_status import RETRY, messages_indicate_busy, normalize_session_status
 from .store import Store
 from .task_spec import (
     TaskSpec,
@@ -21,9 +21,14 @@ def session_status_text(value: Any) -> str:
 
 
 def session_is_idle(live: str, messages: list[dict[str, Any]]) -> bool:
-    if live in {BUSY, RETRY} or "wait" in live or "permission" in live:
-        return False
+    """Idle when messages show no in-flight work.
+
+    OpenCode's /session/status can stay ``busy`` briefly after a turn ends.
+    The dashboard already trusts message probes over that signal; harness must too.
+    """
     if messages_indicate_busy(messages):
+        return False
+    if live in {RETRY} or "wait" in live or "permission" in live:
         return False
     return True
 
@@ -185,7 +190,7 @@ class HarnessRunner:
 
         status = "running"
         summary = "Agent is busy"
-        if live == BUSY or messages_indicate_busy(messages):
+        if messages_indicate_busy(messages):
             status = "running"
             summary = "Agent is busy"
         elif live == RETRY or "wait" in live or "permission" in live:
