@@ -4,13 +4,28 @@ import time
 from typing import Any
 
 from .opencode_client import OpenCodeClient
-from .session_status import BUSY, IDLE, RETRY, normalize_session_status
+from .session_status import BUSY, IDLE, RETRY, messages_indicate_busy, normalize_session_status
 from .store import Store
-from .task_spec import TaskSpec, build_bootstrap_prompt, detect_progress, summarize_messages
+from .task_spec import (
+    TaskSpec,
+    build_bootstrap_prompt,
+    build_periodic_check_prompt,
+    detect_progress_from_messages,
+    needs_continue_reply,
+    summarize_messages,
+)
 
 
 def session_status_text(value: Any) -> str:
     return normalize_session_status(value, default="")
+
+
+def session_is_idle(live: str, messages: list[dict[str, Any]]) -> bool:
+    if live in {BUSY, RETRY} or "wait" in live or "permission" in live:
+        return False
+    if messages_indicate_busy(messages):
+        return False
+    return True
 
 
 class HarnessRunner:
@@ -147,17 +162,30 @@ class HarnessRunner:
             return
 
         live = session_status_text(session_status.get(session_id))
-        messages = await self.opencode.messages(session_id, limit=12)
+        messages = await self.opencode.messages(session_id, limit=50)
         transcript = summarize_messages(messages)
-        progress = detect_progress(transcript, spec)
+        progress = detect_progress_from_messages(messages, spec)
+        is_idle = session_is_idle(live, messages)
+        completed_steps = list(task.get("completed_steps") or [])
+        agent_name = None if spec.agent == "opencode" else spec.agent
 
         current_step = int(task.get("current_step") or 0)
         if progress["step_done"] > 0:
-            current_step = max(current_step, progress["step_done"] - 1)
+            current_step = max(
+                current_step,
+                min(progress["step_done"], len(spec.steps) - 1),
+            )
+
+        all_steps_reported = (
+            len(spec.steps) > 0 and progress["step_done"] >= len(spec.steps)
+        )
+        task_finished = progress["task_complete"] or (
+            spec.acceptance and progress["acceptance_checked"] >= len(spec.acceptance)
+        ) or all_steps_reported
 
         status = "running"
         summary = "Agent is busy"
-        if live == BUSY:
+        if live == BUSY or messages_indicate_busy(messages):
             status = "running"
             summary = "Agent is busy"
         elif live == RETRY or "wait" in live or "permission" in live:
@@ -166,30 +194,60 @@ class HarnessRunner:
         elif "fail" in live or "error" in live:
             status = "failed"
             summary = "Session reported failure"
-        elif progress["task_complete"] or (
-            spec.acceptance and progress["acceptance_checked"] >= len(spec.acceptance)
-        ):
+        elif task_finished:
             status = "completed"
-            summary = "Acceptance criteria appear satisfied"
-        elif live == IDLE or "idle" in live or "complete" in live:
+            summary = (
+                "Agent reported TASK COMPLETE"
+                if progress["task_complete"]
+                else "All harness steps appear complete"
+            )
+        elif is_idle:
             status = "running"
-            summary = "Session idle — monitoring progress"
-            if current_step < len(spec.steps) - 1 and task.get("idle_checks", 0) >= 1:
-                current_step += 1
+            summary = "Session idle — verifying progress"
+            nudge: str | None = None
+            if needs_continue_reply(messages):
+                step_name = spec.steps[min(current_step, len(spec.steps) - 1)]
+                nudge = (
+                    f"Yes — proceed autonomously with step {current_step + 1}: {step_name}. "
+                    "Do not ask for confirmation between harness steps; implement directly. "
+                    "Reply with STEP DONE: "
+                    f"{current_step + 1} when this step is finished."
+                )
+                summary = f"Auto-continued to step {current_step + 1}"
+            elif (
+                progress["step_done"] > 0
+                and progress["step_done"] not in completed_steps
+                and current_step < len(spec.steps) - 1
+            ):
+                next_index = min(progress["step_done"], len(spec.steps) - 1)
                 nudge = (
                     f"Continue harness task '{spec.name}'. "
-                    f"Focus on step {current_step + 1}: {spec.steps[current_step]}. "
-                    "Reply with STEP DONE or TASK COMPLETE when appropriate."
+                    f"Focus on step {next_index + 1}: {spec.steps[next_index]}. "
+                    "Proceed without asking for permission. "
+                    "Reply with STEP DONE: <number> or TASK COMPLETE when appropriate."
                 )
-                await self.opencode.send_prompt_async(session_id=session_id, prompt=nudge)
-                summary = f"Nudged agent toward step {current_step + 1}"
+                current_step = next_index
+                summary = f"Nudged agent toward step {next_index + 1}"
+            else:
+                nudge = build_periodic_check_prompt(
+                    spec,
+                    current_step=current_step,
+                    progress=progress,
+                    completed_steps=completed_steps,
+                )
+                summary = "Periodic check — requested status confirmation"
+            if nudge:
+                await self.opencode.send_prompt_async(
+                    session_id=session_id,
+                    prompt=nudge,
+                    agent=agent_name,
+                )
 
-        completed_steps = list(task.get("completed_steps") or [])
         if progress["step_done"] > 0 and progress["step_done"] not in completed_steps:
             completed_steps.append(progress["step_done"])
 
         idle_checks = int(task.get("idle_checks") or 0)
-        if "idle" in live or "complete" in live:
+        if is_idle:
             idle_checks += 1
         else:
             idle_checks = 0

@@ -160,30 +160,35 @@ def _message_is_aborted(info: dict[str, Any]) -> bool:
     return "abort" in message or "cancel" in message or "stopped" in message
 
 
-def messages_indicate_busy(messages: list[dict[str, Any]]) -> bool:
-    if not messages:
-        return False
-    for message in messages:
+def _latest_assistant_message(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for message in reversed(messages):
         info = message.get("info") if isinstance(message.get("info"), dict) else message
-        if not isinstance(info, dict):
-            continue
-        if info.get("role") not in {"assistant", "agent"}:
-            continue
-        if _message_is_aborted(info):
-            return False
-        time_info = info.get("time") or {}
-        if not time_info.get("completed"):
-            return True
-        for part in message.get("parts") or []:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") != "tool":
-                continue
-            state = part.get("state") or {}
-            tool_status = str(state.get("status", "")).lower()
-            if tool_status in {"running", "pending", "active"}:
-                return True
+        if isinstance(info, dict) and info.get("role") in {"assistant", "agent"}:
+            return message
+    return None
+
+
+def messages_indicate_busy(messages: list[dict[str, Any]]) -> bool:
+    message = _latest_assistant_message(messages)
+    if not message:
         return False
+    info = message.get("info") if isinstance(message.get("info"), dict) else message
+    if not isinstance(info, dict):
+        return False
+    if _message_is_aborted(info):
+        return False
+    time_info = info.get("time") or {}
+    if not time_info.get("completed"):
+        return True
+    for part in message.get("parts") or []:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") != "tool":
+            continue
+        state = part.get("state") or {}
+        tool_status = str(state.get("status", "")).lower()
+        if tool_status in {"running", "pending", "active"}:
+            return True
     return False
 
 

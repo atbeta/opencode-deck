@@ -186,19 +186,18 @@ Acceptance criteria:
 
 Current focus: step {current_step + 1} — {step_name}
 
+Proceed through steps autonomously. Do not ask for confirmation between steps.
+
 When you complete a step, include a line: STEP DONE: <number>
 When all acceptance criteria are satisfied, include a line: TASK COMPLETE
 """
 
 
-def summarize_messages(messages: list[dict[str, Any]], limit: int = 6) -> str:
-    chunks: list[str] = []
-    for message in messages[-limit:]:
-        role = str(message.get("role") or message.get("type") or "message").lower()
-        text = _message_text(message)
-        if text:
-            chunks.append(f"[{role}] {text[:400]}")
-    return "\n".join(chunks)
+def message_role(message: dict[str, Any]) -> str:
+    info = message.get("info") if isinstance(message.get("info"), dict) else message
+    if isinstance(info, dict) and info.get("role"):
+        return str(info["role"]).lower()
+    return str(message.get("role") or message.get("type") or "message").lower()
 
 
 def _message_text(message: dict[str, Any]) -> str:
@@ -214,6 +213,105 @@ def _message_text(message: dict[str, Any]) -> str:
         elif isinstance(part, dict):
             out.append(str(part.get("text") or part.get("content") or ""))
     return "".join(out)
+
+
+def full_transcript(messages: list[dict[str, Any]], limit: int = 12) -> str:
+    chunks: list[str] = []
+    for message in messages[-limit:]:
+        text = _message_text(message)
+        if text:
+            chunks.append(text)
+    return "\n\n".join(chunks)
+
+
+def summarize_messages(messages: list[dict[str, Any]], limit: int = 6) -> str:
+    chunks: list[str] = []
+    for message in messages[-limit:]:
+        role = message_role(message)
+        text = _message_text(message)
+        if text:
+            chunks.append(f"[{role}] {text[:400]}")
+    return "\n".join(chunks)
+
+
+_CONTINUE_PATTERNS = (
+    "should i proceed",
+    "should i continue",
+    "want me to proceed",
+    "want me to continue",
+    "shall i proceed",
+    "ready for step",
+    "may i proceed",
+    "do you want me to",
+)
+
+
+def agent_awaiting_continue(text: str) -> bool:
+    lower = text.lower()
+    return any(pattern in lower for pattern in _CONTINUE_PATTERNS)
+
+
+def needs_continue_reply(messages: list[dict[str, Any]]) -> bool:
+    awaiting_index: int | None = None
+    for index in range(len(messages) - 1, -1, -1):
+        if message_role(messages[index]) != "assistant":
+            continue
+        if agent_awaiting_continue(_message_text(messages[index])):
+            awaiting_index = index
+            break
+    if awaiting_index is None:
+        return False
+    for index in range(awaiting_index + 1, len(messages)):
+        if message_role(messages[index]) == "user":
+            return False
+    return True
+
+
+def assistant_transcript(messages: list[dict[str, Any]], limit: int | None = None) -> str:
+    assistants = [message for message in messages if message_role(message) == "assistant"]
+    if limit is None:
+        return full_transcript(assistants)
+    return full_transcript(assistants[-limit:])
+
+
+def detect_progress_from_messages(messages: list[dict[str, Any]], spec: TaskSpec) -> dict[str, Any]:
+    return detect_progress(assistant_transcript(messages, limit=None), spec)
+
+
+def build_periodic_check_prompt(
+    spec: TaskSpec,
+    *,
+    current_step: int,
+    progress: dict[str, Any],
+    completed_steps: list[int],
+) -> str:
+    step_lines: list[str] = []
+    for index, step in enumerate(spec.steps):
+        step_number = index + 1
+        markers = completed_steps + ([progress["step_done"]] if progress["step_done"] else [])
+        done = step_number in markers or progress["step_done"] >= step_number
+        step_lines.append(f"{step_number}. {step}{' (done)' if done else ''}")
+    steps_block = "\n".join(step_lines) or "1. Complete the goal"
+    acceptance_block = "\n".join(f"- [ ] {item}" for item in spec.acceptance) or "- [ ] Goal achieved"
+    focus_index = min(current_step, len(spec.steps) - 1) if spec.steps else 0
+    focus_step = spec.steps[focus_index] if spec.steps else "Finish remaining work"
+
+    return f"""OpenDeck harness periodic check for "{spec.name}".
+
+The session is idle. Confirm task status before we schedule the next check.
+
+Steps:
+{steps_block}
+
+Acceptance:
+{acceptance_block}
+
+Reply with ONE of:
+- STEP DONE: <number> — if a step is finished (required after each step)
+- TASK COMPLETE — if all acceptance criteria are satisfied
+- Or continue working on step {focus_index + 1}: {focus_step}
+
+Proceed autonomously. Do not ask for confirmation."""
 
 
 def detect_progress(text: str, spec: TaskSpec) -> dict[str, Any]:

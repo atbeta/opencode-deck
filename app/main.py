@@ -401,7 +401,16 @@ async def resume_harness_task(task_id: str) -> dict[str, Any]:
     task = store.get_harness_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    store.update_harness_task(task_id, status="running", next_check_at=time.time())
+    if task.get("status") in {"completed", "failed", "archived"}:
+        store.update_harness_task(
+            task_id,
+            status="running",
+            next_check_at=time.time(),
+            last_summary="Resumed manually",
+            error=None,
+        )
+    else:
+        store.update_harness_task(task_id, status="running", next_check_at=time.time())
     return {"ok": True, "taskId": task_id, "status": "running"}
 
 
