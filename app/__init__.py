@@ -1,0 +1,1 @@
+"""OpenDeck web application."""

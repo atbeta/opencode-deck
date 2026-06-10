@@ -1,0 +1,10 @@
+.env
+.opendeck/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/

@@ -1,0 +1,1335 @@
+<script>
+  import { onMount } from 'svelte';
+
+  let state = $state({
+    server: { ok: false, url: '', message: 'loading' },
+    recentWorkspaces: [],
+    tasks: [],
+    sessions: [],
+    sessionsByDirectory: {},
+    archivedSessions: [],
+    sessionStatus: {},
+    metrics: { running: 0, waiting: 0, failed: 0, completedToday: 0 }
+  });
+
+  let loading = $state(true);
+  let error = $state('');
+  let dispatchError = $state('');
+  let lastRefreshed = $state(0);
+  let now = $state(Date.now());
+  let selectedTaskId = $state(null);
+  let targetMode = $state('workspace');
+  let cwd = $state('/Users/beta/Projects/agent-deck');
+  let _autoSessionPicked = false;
+  let selectedSessionId = $state('');
+  let selectedProjectDir = $state('');
+  let mode = $state('normal');
+  let prompt = $state('Fix SSE reconnect after network drop');
+  let panelTab = $state('task');
+  let harnessEditorMode = $state('guided');
+  let specFormat = $state('yaml');
+  let taskSpec = $state('');
+  let harnessError = $state('');
+  let folderPickerOpen = $state(false);
+  let folderPickerTarget = $state('dispatch');
+  let folderBrowsePath = $state('');
+  let folderBrowseParent = $state(null);
+  let folderBrowseChildren = $state([]);
+  let folderPickerLoading = $state(false);
+  let folderPickerError = $state('');
+
+  const harnessTemplates = {
+    reliability: {
+      name: 'Fix SSE reconnect',
+      goal: 'Fix SSE reconnect after network drop.',
+      steps: [
+        'Investigate current SSE implementation',
+        'Implement reconnect with backoff',
+        'Add regression coverage'
+      ],
+      acceptance: [
+        'SSE reconnects automatically after network drop',
+        'Existing tests pass'
+      ],
+      checkInterval: 5
+    },
+    review: {
+      name: 'Code review pass',
+      goal: 'Review recent changes for correctness, security, and test coverage.',
+      steps: [
+        'Inspect the diff and identify risk areas',
+        'Run tests and note failures',
+        'Propose or apply focused fixes'
+      ],
+      acceptance: [
+        'No critical issues remain open',
+        'Tests pass or failures are documented'
+      ],
+      checkInterval: 5
+    },
+    refactor: {
+      name: 'Targeted refactor',
+      goal: 'Refactor the selected module without changing external behavior.',
+      steps: [
+        'Map current behavior and dependencies',
+        'Apply incremental refactor with small commits',
+        'Verify behavior with existing tests'
+      ],
+      acceptance: [
+        'Public API unchanged',
+        'All existing tests pass'
+      ],
+      checkInterval: 10
+    }
+  };
+
+  const intervalPresets = [1, 5, 15, 30];
+
+  let harnessForm = $state({
+    name: harnessTemplates.reliability.name,
+    workspace: '/Users/beta/Projects/agent-deck',
+    mode: 'normal',
+    checkInterval: 5,
+    goal: harnessTemplates.reliability.goal,
+    steps: [...harnessTemplates.reliability.steps],
+    acceptance: [...harnessTemplates.reliability.acceptance]
+  });
+
+  let collapsedDirs = $state(new Set());
+  let collapsedDirsInitialized = false;
+  $effect(() => {
+    if (collapsedDirsInitialized) return;
+    if (sortedDirectories.length === 0) return;
+    collapsedDirsInitialized = true;
+    collapsedDirs = new Set(sortedDirectories);
+  });
+
+  let drawerSessionId = $state('');
+  let drawerTab = $state('messages');
+  let drawerLoading = $state(false);
+  let drawerError = $state('');
+  let drawerMessages = $state([]);
+  let drawerDiff = $state([]);
+
+  let archivedPopoverOpen = $state(false);
+
+  let confirmDialog = $state(null);
+  function askConfirm({ title, message, confirmLabel = 'Confirm', danger = false }) {
+    return new Promise((resolve) => {
+      confirmDialog = { title, message, confirmLabel, danger, resolve };
+    });
+  }
+  function resolveConfirm(result) {
+    if (confirmDialog?.resolve) confirmDialog.resolve(result);
+    confirmDialog = null;
+  }
+
+  const sortedDirectories = $derived(
+    Object.keys(state.sessionsByDirectory).filter((dir) => dir !== '(unknown)').concat(
+      Object.keys(state.sessionsByDirectory).includes('(unknown)') ? ['(unknown)'] : []
+    )
+  );
+
+  const drawerSession = $derived(
+    state.sessions.find((session) => session.id === drawerSessionId) || null
+  );
+
+  const archivedRecords = $derived(
+    (state.archivedSessions || [])
+      .map((a) => ({ id: a.id, title: a.title || a.id.slice(0, 16), directory: a.directory || '' }))
+      .sort((a, b) => a.title.toLowerCase().localeCompare(b.title.toLowerCase()))
+  );
+
+  const drawerSessionArchived = $derived(
+    drawerSession
+      ? state.archivedSessions?.some((a) => a.id === drawerSession.id)
+      : false
+  );
+
+  const refreshAgeSeconds = $derived(
+    lastRefreshed ? Math.max(0, Math.floor((now - lastRefreshed) / 1000)) : null
+  );
+
+  const sessionsInSelectedProject = $derived(
+    selectedProjectDir ? state.sessionsByDirectory[selectedProjectDir] || [] : []
+  );
+
+  $effect(() => {
+    if (_autoSessionPicked) return;
+    if (selectedSessionId) return;
+    if (state.sessions.length === 0) return;
+    _autoSessionPicked = true;
+    const first = state.sessions[0];
+    selectedProjectDir = first.directory || '(unknown)';
+    selectedSessionId = first.id;
+  });
+
+  $effect(() => {
+    if (sortedDirectories.length === 0) return;
+    if (!selectedProjectDir || !state.sessionsByDirectory[selectedProjectDir]) {
+      selectedProjectDir = sortedDirectories[0];
+    }
+  });
+
+  $effect(() => {
+    const sessions = sessionsInSelectedProject;
+    if (!sessions.length) return;
+    if (!selectedSessionId || !sessions.some((session) => session.id === selectedSessionId)) {
+      selectedSessionId = sessions[0].id;
+    }
+  });
+
+  const selectedTask = $derived(
+    state.tasks.find((task) => task.id === selectedTaskId) ||
+    state.tasks[0] ||
+    null
+  );
+
+  const apiPayload = $derived(
+    targetMode === 'workspace'
+      ? {
+          target: { type: 'workspace', cwd },
+          agent: 'opencode',
+          mode,
+          prompt
+        }
+      : {
+          target: { type: 'session', sessionId: selectedSessionId },
+          agent: 'opencode',
+          mode,
+          prompt
+        }
+  );
+
+  const harnessSpecPreview = $derived(
+    harnessEditorMode === 'guided' ? specFromHarnessForm() : taskSpec
+  );
+
+  const apiPreview = $derived(
+    panelTab === 'task'
+      ? `POST /api/dispatch\n${JSON.stringify(apiPayload, null, 2)}`
+      : `POST /api/tasks\n${JSON.stringify({ format: specFormat, spec: harnessSpecPreview }, null, 2)}`
+  );
+
+  function statusClass(status) {
+    const value = String(status || '').toLowerCase();
+    if (value.includes('archived') || value.includes('deleted') || value.includes('paused')) return 'pill-src';
+    if (value === 'retry' || value.includes('wait') || value.includes('permission')) return 'pill-wait';
+    if (value.includes('fail') || value.includes('error')) return 'pill-fail';
+    if (value === 'idle' || value.includes('complete')) return 'pill-idle';
+    if (value === 'busy' || value.includes('pending') || value.includes('running') || value.includes('streaming')) {
+      return 'pill-run';
+    }
+    return 'pill-idle';
+  }
+
+  function statusShowsDot(status) {
+    const value = String(status || '').toLowerCase();
+    return value === 'busy' || value === 'retry' || value.includes('running') || value.includes('wait');
+  }
+
+  function progressLabel(task) {
+    const pct = Math.round((task?.progress || 0) * 100);
+    const step = (task?.current_step ?? 0) + 1;
+    const total = task?.spec?.steps?.length || 0;
+    return total ? `${pct}% · step ${step}/${total}` : `${pct}%`;
+  }
+
+  const harnessPreview = $derived({
+    steps: harnessForm.steps.filter((s) => s.trim()).length,
+    acceptance: harnessForm.acceptance.filter((s) => s.trim()).length,
+    interval: harnessForm.checkInterval
+  });
+
+  function yamlQuote(value) {
+    if (!value) return '""';
+    if (value.includes('\n')) {
+      return `|\n${value.split('\n').map((line) => `  ${line}`).join('\n')}`;
+    }
+    if (value.includes(' ') || value.includes(':') || value.includes('#')) {
+      return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
+    }
+    return value;
+  }
+
+  function buildYamlFromForm(form) {
+    const lines = [
+      `name: ${yamlQuote(form.name.trim())}`,
+      `workspace: ${yamlQuote(form.workspace.trim())}`,
+      `mode: ${form.mode}`,
+      `check_interval_minutes: ${Math.max(1, Number(form.checkInterval) || 5)}`,
+      `goal: ${yamlQuote(form.goal.trim())}`,
+      'acceptance:'
+    ];
+    for (const item of form.acceptance) {
+      const trimmed = item.trim();
+      if (trimmed) lines.push(`  - ${yamlQuote(trimmed)}`);
+    }
+    lines.push('steps:');
+    for (const item of form.steps) {
+      const trimmed = item.trim();
+      if (trimmed) lines.push(`  - ${yamlQuote(trimmed)}`);
+    }
+    return `${lines.join('\n')}\n`;
+  }
+
+  function buildMarkdownFromForm(form) {
+    const lines = [
+      `# ${form.name.trim()}`,
+      '',
+      `workspace: ${form.workspace.trim()}`,
+      `mode: ${form.mode}`,
+      `check_interval: ${Math.max(1, Number(form.checkInterval) || 5)}m`,
+      '',
+      '## Goal',
+      form.goal.trim(),
+      '',
+      '## Acceptance'
+    ];
+    for (const item of form.acceptance) {
+      const trimmed = item.trim();
+      if (trimmed) lines.push(`- [ ] ${trimmed}`);
+    }
+    lines.push('', '## Steps');
+    form.steps.forEach((item, index) => {
+      const trimmed = item.trim();
+      if (trimmed) lines.push(`${index + 1}. ${trimmed}`);
+    });
+    return `${lines.join('\n')}\n`;
+  }
+
+  function specFromHarnessForm() {
+    return specFormat === 'markdown'
+      ? buildMarkdownFromForm(harnessForm)
+      : buildYamlFromForm(harnessForm);
+  }
+
+  function applyHarnessTemplate(key) {
+    const template = harnessTemplates[key];
+    if (!template) return;
+    harnessForm = {
+      ...harnessForm,
+      name: template.name,
+      goal: template.goal,
+      steps: [...template.steps],
+      acceptance: [...template.acceptance],
+      checkInterval: template.checkInterval
+    };
+  }
+
+  function loadHarnessExample() {
+    taskSpec = buildYamlFromForm(harnessForm);
+    specFormat = 'yaml';
+  }
+
+  function switchHarnessEditor(mode) {
+    if (mode === 'raw' && harnessEditorMode === 'guided') {
+      taskSpec = specFromHarnessForm();
+    }
+    harnessEditorMode = mode;
+  }
+
+  function addHarnessStep() {
+    harnessForm = { ...harnessForm, steps: [...harnessForm.steps, ''] };
+  }
+
+  function removeHarnessStep(index) {
+    harnessForm = {
+      ...harnessForm,
+      steps: harnessForm.steps.filter((_, i) => i !== index)
+    };
+  }
+
+  function addHarnessAcceptance() {
+    harnessForm = { ...harnessForm, acceptance: [...harnessForm.acceptance, ''] };
+  }
+
+  function removeHarnessAcceptance(index) {
+    harnessForm = {
+      ...harnessForm,
+      acceptance: harnessForm.acceptance.filter((_, i) => i !== index)
+    };
+  }
+
+  function sessionStatus(session) {
+    if (!session?.id) return 'unknown';
+    const status = state.sessionStatus?.[session.id];
+    if (typeof status === 'string') return status;
+    if (status && typeof status === 'object') {
+      return status.type || status.status || status.state || 'idle';
+    }
+    return 'idle';
+  }
+
+  function directoryStatus(sessions) {
+    let hasRetry = false;
+    for (const session of sessions) {
+      const status = String(sessionStatus(session)).toLowerCase();
+      if (status === 'busy' || status.includes('running') || status.includes('streaming')) {
+        return 'busy';
+      }
+      if (status === 'retry' || status.includes('wait') || status.includes('permission')) {
+        hasRetry = true;
+      }
+    }
+    return hasRetry ? 'retry' : 'idle';
+  }
+
+  function updatedAgeSeconds(item) {
+    const ts = item?.last_check_at ?? item?.updated ?? item?.updated_at ?? item?.created ?? item?.at;
+    if (!ts) return null;
+    const seconds = Math.max(0, Math.floor(Date.now() / 1000 - Number(ts)));
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+    return `${Math.floor(seconds / 86400)}d`;
+  }
+
+  function toggleDir(path) {
+    const next = new Set(collapsedDirs);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
+    collapsedDirs = next;
+  }
+
+  async function openSessionDrawer(sessionId) {
+    drawerSessionId = sessionId;
+    drawerTab = 'messages';
+    drawerError = '';
+    drawerMessages = [];
+    drawerDiff = [];
+    drawerLoading = true;
+    try {
+      const [msgRes, diffRes] = await Promise.all([
+        fetch(`/api/sessions/${sessionId}/messages`),
+        fetch(`/api/sessions/${sessionId}/diff`)
+      ]);
+      if (!msgRes.ok) throw new Error(await msgRes.text());
+      const msgBody = await msgRes.json();
+      drawerMessages = msgBody.messages || [];
+      if (diffRes.ok) {
+        const diffBody = await diffRes.json();
+        drawerDiff = diffBody.diff || [];
+      }
+    } catch (err) {
+      drawerError = err instanceof Error ? err.message : String(err);
+    } finally {
+      drawerLoading = false;
+    }
+  }
+
+  function closeDrawer() {
+    drawerSessionId = '';
+  }
+
+  function prepareDispatchToSession(sessionId) {
+    if (!sessionId) return;
+    const session = state.sessions.find((item) => item.id === sessionId);
+    targetMode = 'session';
+    selectedProjectDir = session?.directory || '(unknown)';
+    selectedSessionId = sessionId;
+    panelTab = 'task';
+    closeDrawer();
+  }
+
+  function selectProjectDir(dir) {
+    selectedProjectDir = dir;
+    const sessions = state.sessionsByDirectory[dir] || [];
+    selectedSessionId = sessions[0]?.id || '';
+  }
+
+  async function archiveSessionFromDrawer() {
+    if (!drawerSessionId) return;
+    const sessionId = drawerSessionId;
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/archive`, { method: 'POST' });
+      if (!res.ok) throw new Error(await extractError(res));
+      closeDrawer();
+      await refresh();
+    } catch (err) {
+      drawerError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  async function unarchiveSessionFromPopover(sessionId) {
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/archive`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(await extractError(res));
+      await refresh();
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  async function archiveSessionInline(sessionId) {
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/archive`, { method: 'POST' });
+      if (!res.ok) throw new Error(extractError(res));
+      await refresh();
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  async function deleteSessionHard(sessionId) {
+    const ok = await askConfirm({
+      title: 'Delete session',
+      message: 'This will permanently delete the session and all its data. This cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/delete`, { method: 'POST' });
+      if (!res.ok) throw new Error(await extractError(res));
+      await refresh();
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  function summarizeMessage(message) {
+    if (!message) return '';
+    const parts = message.parts || message.content || [];
+    if (Array.isArray(parts)) {
+      return parts
+        .map((part) => {
+          if (typeof part === 'string') return part;
+          return part.text || part.content || JSON.stringify(part);
+        })
+        .join('')
+        .slice(0, 220);
+    }
+    if (typeof message.text === 'string') return message.text.slice(0, 220);
+    return JSON.stringify(message).slice(0, 220);
+  }
+
+  function messageRole(message) {
+    return (message?.role || message?.type || 'message').toLowerCase();
+  }
+
+  async function refresh() {
+    try {
+      error = '';
+      const response = await fetch('/api/state');
+      if (!response.ok) throw new Error(await extractError(response));
+      state = await response.json();
+      if (!selectedTaskId && state.tasks.length > 0) selectedTaskId = state.tasks[0].id;
+      if (drawerSessionId && !state.sessions.some((s) => s.id === drawerSessionId)) {
+        drawerSessionId = '';
+      }
+      lastRefreshed = Date.now();
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    } finally {
+      loading = false;
+    }
+  }
+
+  async function dispatchMessage() {
+    dispatchError = '';
+    try {
+      const response = await fetch('/api/dispatch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(apiPayload)
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || response.statusText);
+      if (body.sessionId) drawerSessionId = body.sessionId;
+      await refresh();
+    } catch (err) {
+      dispatchError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  async function createHarnessTask() {
+    harnessError = '';
+    const spec = harnessEditorMode === 'guided' ? specFromHarnessForm() : taskSpec;
+    if (!harnessForm.name.trim() && harnessEditorMode === 'guided') {
+      harnessError = 'Task name is required';
+      return;
+    }
+    if (!harnessForm.workspace.trim() && harnessEditorMode === 'guided') {
+      harnessError = 'Workspace is required';
+      return;
+    }
+    try {
+      const response = await fetch('/api/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ format: specFormat, spec })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || response.statusText);
+      selectedTaskId = body.taskId;
+      panelTab = 'harness';
+      await refresh();
+    } catch (err) {
+      harnessError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  async function taskAction(action) {
+    if (!selectedTask?.id) return;
+    try {
+      const response = await fetch(`/api/tasks/${selectedTask.id}/${action}`, { method: 'POST' });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || response.statusText);
+      await refresh();
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  async function copyApi() {
+    await navigator.clipboard.writeText(apiPreview);
+  }
+
+  function shortPath(path) {
+    if (!path) return '';
+    if (path === '/') return '/';
+    return path.replace(/\/$/, '');
+  }
+
+  function compactPath(path) {
+    const normalized = shortPath(path);
+    if (!normalized) return '';
+    const parts = normalized.split('/').filter(Boolean);
+    if (parts.length <= 2) return normalized.startsWith('/') ? `/${parts.join('/')}` : parts.join('/');
+    return `…/${parts.slice(-2).join('/')}`;
+  }
+
+  function projectName(path) {
+    if (!path || path === '(unknown)') return '(unknown)';
+    const parts = shortPath(path).split('/').filter(Boolean);
+    return parts[parts.length - 1] || path;
+  }
+
+  function projectDirLabel(dir) {
+    const count = state.sessionsByDirectory[dir]?.length ?? 0;
+    if (dir === '(unknown)') return `Unknown (${count})`;
+    const name = projectName(dir);
+    const path = compactPath(dir);
+    if (path && path !== name) return `${name} — ${path} (${count})`;
+    return `${name} (${count})`;
+  }
+
+  function sessionOptionLabel(session) {
+    const status = sessionStatus(session);
+    const age = updatedAgeSeconds(session);
+    const bits = [session.title || session.id];
+    if (status !== 'idle') bits.push(status);
+    if (age) bits.push(age);
+    return bits.join(' · ');
+  }
+
+  function selectRecentWorkspace(path) {
+    cwd = path;
+    harnessForm = { ...harnessForm, workspace: path };
+  }
+
+  async function removeRecentWorkspace(path, event) {
+    event?.stopPropagation?.();
+    event?.preventDefault?.();
+    try {
+      const response = await fetch(`/api/recent-workspaces?path=${encodeURIComponent(path)}`, {
+        method: 'DELETE'
+      });
+      if (!response.ok) throw new Error(await extractError(response));
+      await refresh();
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  function applyPickedWorkspace(path) {
+    if (folderPickerTarget === 'harness') {
+      harnessForm = { ...harnessForm, workspace: path };
+    } else {
+      cwd = path;
+    }
+    selectRecentWorkspace(path);
+  }
+
+  async function loadBrowse(path) {
+    folderPickerLoading = true;
+    folderPickerError = '';
+    try {
+      const query = path ? `?path=${encodeURIComponent(path)}` : '';
+      const response = await fetch(`/api/browse${query}`);
+      if (!response.ok) throw new Error(await extractError(response));
+      const body = await response.json();
+      folderBrowsePath = body.path;
+      folderBrowseParent = body.parent || null;
+      folderBrowseChildren = body.children || [];
+    } catch (err) {
+      folderPickerError = err instanceof Error ? err.message : String(err);
+    } finally {
+      folderPickerLoading = false;
+    }
+  }
+
+  async function openFolderBrowser(target, startPath) {
+    folderPickerTarget = target;
+    folderPickerOpen = true;
+    folderPickerError = '';
+    await loadBrowse(startPath || (target === 'harness' ? harnessForm.workspace : cwd));
+  }
+
+  function closeFolderPicker() {
+    folderPickerOpen = false;
+    folderPickerError = '';
+  }
+
+  function confirmFolderPick() {
+    if (!folderBrowsePath) return;
+    applyPickedWorkspace(folderBrowsePath);
+    closeFolderPicker();
+  }
+
+  async function pickWorkspace(target) {
+    const initial = target === 'harness' ? harnessForm.workspace : cwd;
+    await openFolderBrowser(target, initial);
+  }
+
+  function extractError(res) {
+    return res.text().then((text) => {
+      try {
+        const data = JSON.parse(text);
+        if (data && typeof data.detail === 'string') return data.detail;
+        if (data && data.data && typeof data.data.message === 'string') return data.data.message;
+      } catch {
+        // not JSON
+      }
+      return text || `HTTP ${res.status}`;
+    });
+  }
+
+  function refreshPollDelayMs() {
+    const statuses = Object.values(state.sessionStatus || {});
+    const hasActive = statuses.some((status) => {
+      const value = String(typeof status === 'string' ? status : status?.type || status?.status || '').toLowerCase();
+      return value === 'busy' || value === 'retry' || value.includes('running') || value.includes('wait');
+    });
+    return hasActive ? 2000 : 5000;
+  }
+
+  onMount(() => {
+    refresh();
+    let pollTimer;
+    const scheduleRefresh = () => {
+      pollTimer = setTimeout(async () => {
+        await refresh();
+        scheduleRefresh();
+      }, refreshPollDelayMs());
+    };
+    scheduleRefresh();
+    const tick = setInterval(() => (now = Date.now()), 1000);
+    return () => {
+      clearTimeout(pollTimer);
+      clearInterval(tick);
+    };
+  });
+</script>
+
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">⌘</div>
+      <span class="brand-name">OpenDeck</span>
+    </div>
+    <div class="conn">
+      <span class:off={!state.server.ok} class="conn-dot"></span>
+      {state.server.ok ? 'Online' : 'Offline'}
+    </div>
+
+    <div class="sidebar-section">
+      <div class="nav-label">Status</div>
+      <div class="status-line"><span class="dim">Server</span><span class="mono" title={state.server.url}>{state.server.url.replace(/^https?:\/\//, '')}</span></div>
+      <div class="status-line"><span class="dim">Sessions</span><span class="mono">{state.sessions.length} visible</span></div>
+      <button class="status-line status-button" type="button" onclick={() => (archivedPopoverOpen = !archivedPopoverOpen)} aria-expanded={archivedPopoverOpen}>
+        <span class="dim">Archived</span>
+        <span class="mono">{(state.archivedSessions || []).length} ▸</span>
+      </button>
+      {#if archivedPopoverOpen}
+        <div class="hidden-popover" role="dialog" aria-label="Archived sessions">
+          <div class="hidden-popover-head">
+            <span>Archived sessions</span>
+            <button class="btn btn-ghost btn-sm" type="button" onclick={() => (archivedPopoverOpen = false)}>Close</button>
+          </div>
+          {#if archivedRecords.length === 0}
+            <div class="dim empty-mini">No archived sessions.</div>
+          {:else}
+            <ul class="hidden-list">
+              {#each archivedRecords as record}
+                <li>
+                  <div class="hidden-title">{record.title}</div>
+                  <div class="mono hidden-id">{record.directory || record.id}</div>
+                  <div class="row-actions">
+                    <button class="btn btn-ghost btn-sm" type="button" onclick={() => unarchiveSessionFromPopover(record.id)}>Unarchive</button>
+                    <button class="btn btn-ghost btn-sm btn-danger" type="button" onclick={() => deleteSessionHard(record.id)}>Delete</button>
+                  </div>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+      {/if}
+      <div class="status-line"><span class="dim">Updated</span><span class="mono">{refreshAgeSeconds === null ? '—' : `${refreshAgeSeconds}s ago`}</span></div>
+    </div>
+
+    <div class="sidebar-section sidebar-recent">
+      <div class="nav-label">Recent Workspaces</div>
+      <div class="recent-list">
+        {#if state.recentWorkspaces.length === 0}
+          <div class="dim empty-mini">Used paths will appear here.</div>
+        {:else}
+          {#each state.recentWorkspaces as workspace}
+            <div
+              class="recent-row"
+              class:active={cwd === workspace || harnessForm.workspace === workspace}
+            >
+              <button
+                class="recent-item mono"
+                type="button"
+                title={workspace}
+                onclick={() => selectRecentWorkspace(workspace)}
+              >{compactPath(workspace)}</button>
+              <button
+                class="recent-remove"
+                type="button"
+                aria-label="Remove from recents"
+                title="Remove"
+                onclick={(event) => removeRecentWorkspace(workspace, event)}
+              >×</button>
+            </div>
+          {/each}
+        {/if}
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="status-bar">
+      <div class="status-left">
+        <h1>OpenCode Server</h1>
+        <span class={`pill ${state.server.ok ? 'pill-ok' : 'pill-fail'}`}>
+          <span class="pill-dot"></span>{state.server.ok ? 'Healthy' : 'Unavailable'}
+        </span>
+        <div class="status-meta">
+          <span>{state.sessions.length} sessions</span>
+          <span>·</span>
+          <span>{state.tasks.length} tasks</span>
+        </div>
+      </div>
+    </header>
+
+    {#if error}
+      <div class="error" style="padding: 10px 20px;">{error}</div>
+    {/if}
+
+    <section class="table-section">
+      {#if loading}
+        <div class="empty">Loading OpenDeck state…</div>
+      {:else if state.tasks.length === 0 && state.sessions.length === 0}
+        <div class="empty">No sessions or harness tasks. Use the Task panel to dispatch or start a harness task.</div>
+      {:else}
+        {#if state.tasks.length > 0}
+          <div class="group">
+            <div class="group-head"><span class="group-title">Harness Tasks</span><span class="group-count">{state.tasks.length}</span></div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Workspace</th>
+                  <th>Status</th>
+                  <th>Progress</th>
+                  <th>Checked</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each state.tasks as task}
+                  <tr class:highlight={selectedTask?.id === task.id} onclick={() => (selectedTaskId = task.id)}>
+                    <td><span class="task-title">{task.name}</span></td>
+                    <td class="mono">{shortPath(task.workspace)}</td>
+                    <td><span class={`pill ${statusClass(task.status)}`}><span class="pill-dot"></span>{task.status}</span></td>
+                    <td class="mono">{progressLabel(task)}</td>
+                    <td class="mono">{updatedAgeSeconds(task) ?? '—'}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+
+        {#if sortedDirectories.length > 0}
+          <div class="group">
+            <div class="group-head">
+              <span class="group-title">Sessions</span>
+              <span class="group-count">{state.sessions.length} across {sortedDirectories.length} dir{sortedDirectories.length === 1 ? '' : 's'}</span>
+            </div>
+            {#each sortedDirectories as dir}
+              {@const sessions = state.sessionsByDirectory[dir]}
+              {@const isCollapsed = collapsedDirs.has(dir)}
+              {@const dirStatus = directoryStatus(sessions)}
+              <div class="dir-block" class:dir-block-active={dirStatus !== 'idle'}>
+                <button
+                  class="dir-head"
+                  class:dir-head-active={dirStatus !== 'idle'}
+                  type="button"
+                  onclick={() => toggleDir(dir)}
+                  aria-expanded={!isCollapsed}
+                >
+                  <span class="dir-chevron" class:collapsed={isCollapsed} aria-hidden="true"></span>
+                  <span class="dir-path mono">{shortPath(dir)}</span>
+                  {#if dirStatus !== 'idle'}
+                    <span class={`pill pill-compact ${statusClass(dirStatus)}`}>
+                      {#if statusShowsDot(dirStatus)}
+                        <span class="pill-dot"></span>
+                      {/if}
+                      {dirStatus}
+                    </span>
+                  {/if}
+                  <span class="dir-count">{sessions.length}</span>
+                </button>
+                {#if !isCollapsed}
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Title</th>
+                        <th>Status</th>
+                        <th>Updated</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {#each sessions as session}
+                        <tr
+                          class:highlight={drawerSessionId === session.id}
+                          onclick={() => openSessionDrawer(session.id)}
+                        >
+                          <td><span class="task-title">{session.title}</span></td>
+                          <td>
+                            <span class={`pill ${statusClass(sessionStatus(session))}`}>
+                              {#if statusShowsDot(sessionStatus(session))}
+                                <span class="pill-dot"></span>
+                              {/if}
+                              {sessionStatus(session)}
+                            </span>
+                          </td>
+                          <td class="mono">{updatedAgeSeconds(session) ?? '—'}</td>
+                          <td class="row-action">
+                            <button class="btn btn-ghost btn-sm row-btn" type="button" title="Archive" onclick={(e) => { e.stopPropagation(); archiveSessionInline(session.id); }}>Archive</button>
+                            <button class="btn btn-ghost btn-sm row-btn" type="button" title="Dispatch to this session" onclick={(e) => { e.stopPropagation(); prepareDispatchToSession(session.id); }}>Dispatch</button>
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {:else if state.sessions.length === 0 && state.tasks.length > 0}
+          <div class="group">
+            <div class="empty">No top-level sessions.</div>
+          </div>
+        {/if}
+      {/if}
+    </section>
+  </main>
+
+  <aside class="dispatch">
+    <div class="dispatch-head">
+      <h2>Actions</h2>
+      <button class="btn btn-ghost btn-sm" type="button" onclick={copyApi}>Copy API</button>
+    </div>
+
+    <div class="dispatch-tabs">
+      <button type="button" class:active={panelTab === 'task'} onclick={() => (panelTab = 'task')}>Task</button>
+      <button type="button" class:active={panelTab === 'harness'} onclick={() => (panelTab = 'harness')}>Harness</button>
+    </div>
+
+    <div class="dispatch-body">
+      {#if panelTab === 'task'}
+        <section class="block">
+          <div class="block-label">Target</div>
+          <div class="segmented">
+            <button type="button" class:active={targetMode === 'workspace'} onclick={() => (targetMode = 'workspace')}>New workspace</button>
+            <button type="button" class:active={targetMode === 'session'} onclick={() => (targetMode = 'session')}>Existing session</button>
+          </div>
+          {#if targetMode === 'workspace'}
+            <div class="field">
+              <label for="cwd">Workspace</label>
+              <div class="path-row">
+                <input id="cwd" type="text" bind:value={cwd} />
+                <button class="btn btn-ghost btn-sm path-pick" type="button" title="Choose folder" aria-label="Choose folder" onclick={() => pickWorkspace('dispatch')}>…</button>
+              </div>
+            </div>
+          {:else}
+            <div class="field">
+              <label for="project-dir">Project</label>
+              <select
+                id="project-dir"
+                value={selectedProjectDir}
+                onchange={(e) => selectProjectDir(e.currentTarget.value)}
+              >
+                {#each sortedDirectories as dir}
+                  {@const sessions = state.sessionsByDirectory[dir]}
+                  {#if sessions?.length}
+                    <option value={dir}>{projectDirLabel(dir)}</option>
+                  {/if}
+                {/each}
+              </select>
+            </div>
+            <div class="field">
+              <label for="session">Session</label>
+              <select id="session" bind:value={selectedSessionId} disabled={sessionsInSelectedProject.length === 0}>
+                {#each sessionsInSelectedProject as session}
+                  <option value={session.id}>{sessionOptionLabel(session)}</option>
+                {/each}
+              </select>
+            </div>
+          {/if}
+        </section>
+
+        <section class="block">
+          <div class="block-label">Run</div>
+          <div class="segmented">
+            <button type="button" class:active={mode === 'normal'} onclick={() => (mode = 'normal')}>Normal</button>
+            <button type="button" class:active={mode === 'plan'} onclick={() => (mode = 'plan')}>Plan</button>
+            <button type="button" class:active={mode === 'review'} onclick={() => (mode = 'review')}>Review</button>
+          </div>
+        </section>
+
+        <section class="block">
+          <div class="block-label">Prompt</div>
+          <textarea id="prompt" placeholder="Ask OpenCode to…" bind:value={prompt}></textarea>
+          <button class="btn btn-primary" type="button" onclick={dispatchMessage}>
+            {targetMode === 'workspace' ? 'Dispatch to Workspace' : 'Send to Session'}
+          </button>
+          {#if dispatchError}
+            <div class="error" style="margin-top: 8px;">{dispatchError}</div>
+          {/if}
+        </section>
+      {:else}
+        <section class="block harness-block">
+          <div class="segmented">
+            <button type="button" class:active={harnessEditorMode === 'guided'} onclick={() => switchHarnessEditor('guided')}>Guided</button>
+            <button type="button" class:active={harnessEditorMode === 'raw'} onclick={() => switchHarnessEditor('raw')}>Raw spec</button>
+          </div>
+
+          <div class="template-row">
+            <span class="dim template-label">Templates</span>
+            <div class="template-chips">
+              <button class="template-chip" type="button" onclick={() => applyHarnessTemplate('reliability')}>Reliability</button>
+              <button class="template-chip" type="button" onclick={() => applyHarnessTemplate('review')}>Review</button>
+              <button class="template-chip" type="button" onclick={() => applyHarnessTemplate('refactor')}>Refactor</button>
+            </div>
+          </div>
+
+          {#if harnessEditorMode === 'guided'}
+            <div class="field">
+              <label for="harness-name">Task name</label>
+              <input id="harness-name" type="text" bind:value={harnessForm.name} placeholder="e.g. Fix SSE reconnect" />
+            </div>
+
+            <div class="field">
+              <label for="harness-workspace">Workspace</label>
+              <div class="path-row">
+                <input id="harness-workspace" class="mono" type="text" bind:value={harnessForm.workspace} placeholder="Recent, Browse, or type a path" />
+                <button class="btn btn-ghost btn-sm path-pick" type="button" title="Choose folder" aria-label="Choose folder" onclick={() => pickWorkspace('harness')}>…</button>
+              </div>
+            </div>
+
+            <div class="field">
+              <label>Run mode</label>
+              <div class="segmented">
+                <button type="button" class:active={harnessForm.mode === 'normal'} onclick={() => (harnessForm = { ...harnessForm, mode: 'normal' })}>Normal</button>
+                <button type="button" class:active={harnessForm.mode === 'plan'} onclick={() => (harnessForm = { ...harnessForm, mode: 'plan' })}>Plan</button>
+                <button type="button" class:active={harnessForm.mode === 'review'} onclick={() => (harnessForm = { ...harnessForm, mode: 'review' })}>Review</button>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="harness-interval">Check every</label>
+              <div class="interval-picker">
+                <div class="interval-presets">
+                  {#each intervalPresets as minutes}
+                    <button
+                      type="button"
+                      class="interval-preset"
+                      class:active={Number(harnessForm.checkInterval) === minutes}
+                      onclick={() => (harnessForm = { ...harnessForm, checkInterval: minutes })}
+                    >{minutes}m</button>
+                  {/each}
+                </div>
+                <div class="interval-custom">
+                  <input
+                    id="harness-interval"
+                    type="number"
+                    min="1"
+                    max="120"
+                    bind:value={harnessForm.checkInterval}
+                  />
+                  <span class="interval-unit">min</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="harness-goal">Goal</label>
+              <textarea id="harness-goal" class="harness-goal" bind:value={harnessForm.goal} placeholder="What should the agent accomplish?"></textarea>
+            </div>
+
+            <div class="field">
+              <div class="field-head">
+                <label>Steps</label>
+                <button class="btn btn-ghost btn-sm" type="button" onclick={addHarnessStep}>+ Add</button>
+              </div>
+              <div class="harness-list">
+                {#each harnessForm.steps as _step, i}
+                  <div class="harness-list-row">
+                    <span class="harness-list-index">{i + 1}</span>
+                    <input type="text" bind:value={harnessForm.steps[i]} placeholder="Describe this step" />
+                    <button class="list-remove" type="button" aria-label="Remove step" onclick={() => removeHarnessStep(i)}>×</button>
+                  </div>
+                {/each}
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="field-head">
+                <label>Acceptance</label>
+                <button class="btn btn-ghost btn-sm" type="button" onclick={addHarnessAcceptance}>+ Add</button>
+              </div>
+              <div class="harness-list">
+                {#each harnessForm.acceptance as _item, i}
+                  <div class="harness-list-row">
+                    <span class="harness-list-index">✓</span>
+                    <input type="text" bind:value={harnessForm.acceptance[i]} placeholder="Done when…" />
+                    <button class="list-remove" type="button" aria-label="Remove criterion" onclick={() => removeHarnessAcceptance(i)}>×</button>
+                  </div>
+                {/each}
+              </div>
+            </div>
+
+            <div class="harness-preview">
+              <span>{harnessPreview.steps} steps</span>
+              <span>·</span>
+              <span>{harnessPreview.acceptance} criteria</span>
+              <span>·</span>
+              <span>every {harnessPreview.interval} min</span>
+            </div>
+          {:else}
+            <div class="field">
+              <label>Spec format</label>
+              <div class="segmented">
+                <button type="button" class:active={specFormat === 'yaml'} onclick={() => (specFormat = 'yaml')}>YAML</button>
+                <button type="button" class:active={specFormat === 'markdown'} onclick={() => (specFormat = 'markdown')}>Markdown</button>
+              </div>
+            </div>
+            <div class="field">
+              <div class="field-head">
+                <label for="task-spec">Task spec</label>
+                <button class="btn btn-ghost btn-sm" type="button" onclick={loadHarnessExample}>Load example</button>
+              </div>
+              <textarea id="task-spec" class="spec-editor" placeholder="Define goal, steps, acceptance…" bind:value={taskSpec}></textarea>
+            </div>
+          {/if}
+
+          <button class="btn btn-primary" type="button" onclick={createHarnessTask}>Start Harness Task</button>
+          {#if harnessError}
+            <div class="error">{harnessError}</div>
+          {/if}
+        </section>
+      {/if}
+
+      <section class="block">
+        <div class="block-label">Selected harness task</div>
+        {#if selectedTask}
+          <div class="task-card">
+            <div class="task-card-head">
+              <span class={`pill ${statusClass(selectedTask.status)}`}><span class="pill-dot"></span>{selectedTask.status}</span>
+              <span class="mono dim">{progressLabel(selectedTask)}</span>
+            </div>
+            <div class="task-card-title">{selectedTask.name}</div>
+            {#if selectedTask.last_summary}
+              <div class="dim">{selectedTask.last_summary}</div>
+            {/if}
+            {#if selectedTask.error}
+              <div class="error">{selectedTask.error}</div>
+            {/if}
+            <div class="row-actions">
+              {#if selectedTask.status === 'paused'}
+                <button class="btn btn-ghost btn-sm" type="button" onclick={() => taskAction('resume')}>Resume</button>
+              {:else if !['completed', 'failed', 'archived'].includes(selectedTask.status)}
+                <button class="btn btn-ghost btn-sm" type="button" onclick={() => taskAction('pause')}>Pause</button>
+              {/if}
+              {#if !['completed', 'archived'].includes(selectedTask.status)}
+                <button class="btn btn-ghost btn-sm" type="button" onclick={() => taskAction('complete')}>Complete</button>
+              {/if}
+            </div>
+            {#if selectedTask.check_log?.length}
+              <details class="check-log">
+                <summary>Check log ({selectedTask.check_log.length})</summary>
+                <ol>
+                  {#each selectedTask.check_log.slice().reverse().slice(0, 8) as entry}
+                    <li>
+                      <span class="mono dim">{updatedAgeSeconds({ updated: entry.at }) ?? '—'}</span>
+                      <span class={`pill ${statusClass(entry.status)}`}>{entry.status}</span>
+                      <span>{entry.summary}</span>
+                    </li>
+                  {/each}
+                </ol>
+              </details>
+            {/if}
+          </div>
+        {:else}
+          <div class="dim">No harness tasks yet.</div>
+        {/if}
+      </section>
+
+      <details class="api-block">
+        <summary>API Preview</summary>
+        <button class="btn btn-ghost btn-sm copy-api" type="button" onclick={copyApi}>Copy</button>
+        <pre class="api-preview">{apiPreview}</pre>
+      </details>
+    </div>
+  </aside>
+</div>
+
+{#if drawerSession}
+  <div class="drawer-mask" onclick={closeDrawer} role="presentation"></div>
+  <aside class="drawer" role="dialog" aria-label="Session detail">
+    <header class="drawer-head">
+      <div>
+        <div class="drawer-eyebrow">Session</div>
+        <h3>{drawerSession.title}</h3>
+        <div class="mono drawer-dir">{shortPath(drawerSession.directory) || '(unknown directory)'}</div>
+        <div class="drawer-status-row">
+          <span class={`pill ${statusClass(sessionStatus(drawerSession))}`}>
+            {#if statusShowsDot(sessionStatus(drawerSession))}
+              <span class="pill-dot"></span>
+            {/if}
+            {sessionStatus(drawerSession)}
+          </span>
+          {#if drawerSessionArchived}
+            <span class="pill pill-fail" style="display: inline-flex; margin-left: 6px;"><span class="pill-dot"></span>archived</span>
+          {/if}
+        </div>
+      </div>
+      <button class="btn btn-ghost btn-sm" type="button" onclick={closeDrawer}>Close</button>
+    </header>
+
+    <div class="drawer-tabs">
+      <button class:active={drawerTab === 'messages'} type="button" onclick={() => (drawerTab = 'messages')}>Messages</button>
+      <button class:active={drawerTab === 'diff'} type="button" onclick={() => (drawerTab = 'diff')}>Diff</button>
+      <button class:active={drawerTab === 'meta'} type="button" onclick={() => (drawerTab = 'meta')}>Meta</button>
+    </div>
+
+    <div class="drawer-body">
+      {#if drawerLoading}
+        <div class="empty">Loading…</div>
+      {:else if drawerError}
+        <div class="error">{drawerError}</div>
+      {:else if drawerTab === 'messages'}
+        {#if drawerMessages.length === 0}
+          <div class="empty">No messages yet.</div>
+        {:else}
+          <ol class="msg-list">
+            {#each drawerMessages as message}
+              <li class={`msg msg-${messageRole(message)}`}>
+                <div class="msg-meta mono">{messageRole(message)}</div>
+                <div class="msg-text">{summarizeMessage(message) || '(empty)'}</div>
+              </li>
+            {/each}
+          </ol>
+        {/if}
+      {:else if drawerTab === 'diff'}
+        {#if drawerDiff.length === 0}
+          <div class="empty">No diff recorded.</div>
+        {:else}
+          <ul class="diff-list">
+            {#each drawerDiff as file}
+              <li>
+                <div class="mono">{file.file || file.path || JSON.stringify(file)}</div>
+                <pre class="diff-block">{JSON.stringify(file, null, 2)}</pre>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      {:else}
+        <pre class="payload-block">{JSON.stringify(drawerSession, null, 2)}</pre>
+      {/if}
+    </div>
+
+    <footer class="drawer-foot">
+      {#if drawerSessionArchived}
+        <button class="btn btn-ghost" type="button" onclick={unarchiveSessionFromPopover(drawerSessionId)}>Unarchive</button>
+      {:else}
+        <button class="btn btn-ghost" type="button" onclick={archiveSessionFromDrawer}>Archive</button>
+      {/if}
+    </footer>
+  </aside>
+{/if}
+
+{#if folderPickerOpen}
+  <div class="modal-mask" onclick={closeFolderPicker} role="presentation"></div>
+  <div class="modal folder-picker-modal" role="dialog" aria-modal="true" aria-label="Select workspace folder">
+    <h3 class="modal-title">Select workspace</h3>
+    <div class="folder-picker-path mono" title={folderBrowsePath}>{folderBrowsePath || '—'}</div>
+    {#if folderPickerError}
+      <div class="error">{folderPickerError}</div>
+    {/if}
+    {#if folderPickerLoading}
+      <div class="dim folder-picker-status">Loading…</div>
+    {:else}
+      <ul class="folder-picker-list">
+        {#if folderBrowseParent}
+          <li>
+            <button class="folder-picker-item" type="button" onclick={() => loadBrowse(folderBrowseParent)}>
+              <span class="folder-picker-icon">↩</span>
+              <span>Parent folder</span>
+            </button>
+          </li>
+        {/if}
+        {#each folderBrowseChildren as child}
+          <li>
+            <button class="folder-picker-item" type="button" onclick={() => loadBrowse(child.path)}>
+              <span class="folder-picker-icon">▸</span>
+              <span>{child.name}</span>
+            </button>
+          </li>
+        {/each}
+        {#if !folderBrowseParent && folderBrowseChildren.length === 0}
+          <li class="dim folder-picker-empty">No subfolders here.</li>
+        {/if}
+      </ul>
+    {/if}
+    <div class="folder-picker-foot">
+      <button class="btn btn-primary folder-picker-select" type="button" onclick={confirmFolderPick} disabled={!folderBrowsePath}>
+        Select this folder
+      </button>
+      <button class="btn btn-ghost folder-picker-cancel" type="button" onclick={closeFolderPicker}>Cancel</button>
+    </div>
+  </div>
+{/if}
+
+{#if confirmDialog}
+  <div class="modal-mask" onclick={() => resolveConfirm(false)} role="presentation"></div>
+  <div class="modal" role="dialog" aria-modal="true" aria-label={confirmDialog.title}>
+    <h3 class="modal-title">{confirmDialog.title}</h3>
+    <p class="modal-message">{confirmDialog.message}</p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" type="button" onclick={() => resolveConfirm(false)}>Cancel</button>
+      <button
+        class={`btn ${confirmDialog.danger ? 'btn-danger-solid' : 'btn-primary'}`}
+        type="button"
+        autofocus
+        onclick={() => resolveConfirm(true)}
+      >{confirmDialog.confirmLabel}</button>
+    </div>
+  </div>
+{/if}
