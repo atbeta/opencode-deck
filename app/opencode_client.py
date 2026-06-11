@@ -289,7 +289,16 @@ class OpenCodeClient:
         return response
 
     def _client(self, timeout: float = 20) -> httpx.AsyncClient:
-        return httpx.AsyncClient(base_url=self.base_url, auth=self.auth, timeout=timeout)
+        # ``trust_env=False`` prevents httpx from picking up HTTP_PROXY /
+        # HTTPS_PROXY / NO_PROXY from the environment. OpenCode is a local
+        # daemon; sending health checks or session requests through an
+        # unrelated system proxy silently fails or hangs.
+        return httpx.AsyncClient(
+            base_url=self.base_url,
+            auth=self.auth,
+            timeout=timeout,
+            transport=httpx.AsyncHTTPTransport(trust_env=False),
+        )
 
     def _normalize_session(self, session: dict[str, Any]) -> dict[str, Any]:
         session_id = session.get("id") or session.get("sessionID") or session.get("sessionId")

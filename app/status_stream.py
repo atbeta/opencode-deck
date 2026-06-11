@@ -80,6 +80,7 @@ class SessionStatusStream:
                     base_url=self.base_url,
                     auth=self.auth,
                     timeout=None,
+                    transport=httpx.AsyncHTTPTransport(trust_env=False),
                 ) as client:
                     async with client.stream("GET", "/global/event") as response:
                         response.raise_for_status()
