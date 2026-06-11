@@ -179,8 +179,17 @@
     }
   });
 
+  const activeHarnessTasks = $derived(
+    (state.tasks || []).filter((task) => task.status !== 'archived')
+  );
+
+  const archivedHarnessTasks = $derived(
+    (state.tasks || []).filter((task) => task.status === 'archived')
+  );
+
   const selectedTask = $derived(
     state.tasks.find((task) => task.id === selectedTaskId) ||
+    activeHarnessTasks[0] ||
     state.tasks[0] ||
     null
   );
@@ -228,11 +237,17 @@
     return value === 'busy' || value === 'retry' || value.includes('running') || value.includes('wait');
   }
 
-  function progressLabel(task) {
-    const pct = Math.round((task?.progress || 0) * 100);
-    const step = (task?.current_step ?? 0) + 1;
+  function stepProgressLabel(task) {
     const total = task?.spec?.steps?.length || 0;
-    return total ? `${pct}% · step ${step}/${total}` : `${pct}%`;
+    if (!total) {
+      return task?.status === 'completed' ? 'Done' : '—';
+    }
+    const completed = Array.isArray(task?.completed_steps) ? task.completed_steps.length : 0;
+    const done =
+      task?.status === 'completed'
+        ? total
+        : Math.min(completed, total);
+    return `${done}/${total}`;
   }
 
   const harnessPreview = $derived({
@@ -514,7 +529,14 @@
       const response = await fetch('/api/state');
       if (!response.ok) throw new Error(await extractError(response));
       state = await response.json();
-      if (!selectedTaskId && state.tasks.length > 0) selectedTaskId = state.tasks[0].id;
+      const tasks = state.tasks || [];
+      const active = tasks.filter((task) => task.status !== 'archived');
+      if (
+        !selectedTaskId ||
+        !tasks.some((task) => task.id === selectedTaskId)
+      ) {
+        selectedTaskId = (active[0] || tasks[0])?.id || null;
+      }
       if (drawerSessionId && !state.sessions.some((s) => s.id === drawerSessionId)) {
         drawerSessionId = '';
       }
@@ -580,6 +602,18 @@
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
     }
+  }
+
+  function selectHarnessTask(taskId) {
+    selectedTaskId = taskId;
+    panelTab = 'harness';
+  }
+
+  function viewHarnessSession(task) {
+    const sessionId = task?.active_session_id;
+    if (!sessionId) return;
+    selectHarnessTask(task.id);
+    openSessionDrawer(sessionId);
   }
 
   async function copyApi() {
@@ -835,27 +869,59 @@
       {:else if state.tasks.length === 0 && state.sessions.length === 0}
         <div class="empty">No sessions or harness tasks. Use the Task panel to dispatch or start a harness task.</div>
       {:else}
-        {#if state.tasks.length > 0}
+        {#if activeHarnessTasks.length > 0}
           <div class="group">
-            <div class="group-head"><span class="group-title">Harness Tasks</span><span class="group-count">{state.tasks.length}</span></div>
+            <div class="group-head"><span class="group-title">Harness Tasks</span><span class="group-count">{activeHarnessTasks.length}</span></div>
             <table>
               <thead>
                 <tr>
                   <th>Name</th>
                   <th>Workspace</th>
                   <th>Status</th>
-                  <th>Progress</th>
+                  <th>Steps</th>
                   <th>Checked</th>
                 </tr>
               </thead>
               <tbody>
-                {#each state.tasks as task}
-                  <tr class:highlight={selectedTask?.id === task.id} onclick={() => (selectedTaskId = task.id)}>
+                {#each activeHarnessTasks as task}
+                  <tr class:highlight={selectedTask?.id === task.id} onclick={() => selectHarnessTask(task.id)}>
                     <td><span class="task-title">{task.name}</span></td>
                     <td class="mono">{shortPath(task.workspace)}</td>
                     <td><span class={`pill ${statusClass(task.status)}`}><span class="pill-dot"></span>{task.status}</span></td>
-                    <td class="mono">{progressLabel(task)}</td>
+                    <td class="mono">{stepProgressLabel(task)}</td>
                     <td class="mono">{updatedAgeSeconds(task) ?? '—'}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+
+        {#if archivedHarnessTasks.length > 0}
+          <div class="group">
+            <div class="group-head"><span class="group-title">Archived Harness</span><span class="group-count">{archivedHarnessTasks.length}</span></div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Workspace</th>
+                  <th>Status</th>
+                  <th>Steps</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each archivedHarnessTasks as task}
+                  <tr class:highlight={selectedTask?.id === task.id} onclick={() => selectHarnessTask(task.id)}>
+                    <td><span class="task-title">{task.name}</span></td>
+                    <td class="mono">{shortPath(task.workspace)}</td>
+                    <td><span class={`pill ${statusClass(task.status)}`}><span class="pill-dot"></span>{task.status}</span></td>
+                    <td class="mono">{stepProgressLabel(task)}</td>
+                    <td>
+                      {#if task.active_session_id}
+                        <button class="btn btn-ghost btn-sm row-btn" type="button" onclick={(e) => { e.stopPropagation(); viewHarnessSession(task); }}>View</button>
+                      {/if}
+                    </td>
                   </tr>
                 {/each}
               </tbody>
@@ -1152,9 +1218,12 @@
           <div class="task-card">
             <div class="task-card-head">
               <span class={`pill ${statusClass(selectedTask.status)}`}><span class="pill-dot"></span>{selectedTask.status}</span>
-              <span class="mono dim">{progressLabel(selectedTask)}</span>
+              <span class="mono dim">{stepProgressLabel(selectedTask)} steps</span>
             </div>
             <div class="task-card-title">{selectedTask.name}</div>
+            {#if selectedTask.workspace}
+              <div class="mono dim">{shortPath(selectedTask.workspace)}</div>
+            {/if}
             {#if selectedTask.last_summary}
               <div class="dim">{selectedTask.last_summary}</div>
             {/if}
@@ -1162,13 +1231,21 @@
               <div class="error">{selectedTask.error}</div>
             {/if}
             <div class="row-actions">
+              {#if selectedTask.active_session_id}
+                <button class="btn btn-ghost btn-sm" type="button" onclick={() => viewHarnessSession(selectedTask)}>View session</button>
+              {/if}
               {#if selectedTask.status === 'paused'}
                 <button class="btn btn-ghost btn-sm" type="button" onclick={() => taskAction('resume')}>Resume</button>
+              {:else if selectedTask.status === 'archived'}
+                <button class="btn btn-ghost btn-sm" type="button" onclick={() => taskAction('resume')}>Restore</button>
               {:else if !['completed', 'failed', 'archived'].includes(selectedTask.status)}
                 <button class="btn btn-ghost btn-sm" type="button" onclick={() => taskAction('pause')}>Pause</button>
               {/if}
               {#if !['completed', 'archived'].includes(selectedTask.status)}
                 <button class="btn btn-ghost btn-sm" type="button" onclick={() => taskAction('complete')}>Complete</button>
+              {/if}
+              {#if selectedTask.status !== 'archived'}
+                <button class="btn btn-ghost btn-sm" type="button" onclick={() => taskAction('archive')}>Archive</button>
               {/if}
             </div>
             {#if selectedTask.check_log?.length}

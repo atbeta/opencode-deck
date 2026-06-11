@@ -434,6 +434,29 @@ async def complete_harness_task(task_id: str) -> dict[str, Any]:
     return {"ok": True, "taskId": task_id, "status": "completed"}
 
 
+@app.post("/api/tasks/{task_id}/archive")
+async def archive_harness_task(task_id: str) -> dict[str, Any]:
+    task = store.get_harness_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    store.update_harness_task(
+        task_id,
+        status="archived",
+        next_check_at=None,
+        last_summary="Archived manually",
+    )
+    store.append_harness_check(
+        task_id,
+        status="archived",
+        summary="Archived manually",
+    )
+    session_id = task.get("active_session_id")
+    if session_id:
+        with contextlib.suppress(Exception):
+            await opencode.set_archived(session_id, int(time.time() * 1000))
+    return {"ok": True, "taskId": task_id, "status": "archived"}
+
+
 @app.get("/api/sessions/{session_id}/messages")
 async def session_messages(session_id: str) -> dict[str, Any]:
     try:

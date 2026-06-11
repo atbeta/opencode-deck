@@ -251,6 +251,14 @@ class HarnessRunner:
         if progress["step_done"] > 0 and progress["step_done"] not in completed_steps:
             completed_steps.append(progress["step_done"])
 
+        total_steps = len(spec.steps)
+        if status == "completed":
+            step_progress = 1.0
+        elif total_steps:
+            step_progress = min(1.0, len(completed_steps) / total_steps)
+        else:
+            step_progress = 1.0 if task_finished else 0.0
+
         idle_checks = int(task.get("idle_checks") or 0)
         if is_idle:
             idle_checks += 1
@@ -264,7 +272,7 @@ class HarnessRunner:
             current_step=current_step,
             completed_steps=completed_steps,
             idle_checks=idle_checks,
-            progress=progress["acceptance_progress"],
+            progress=step_progress,
             last_check_at=now,
             next_check_at=next_check,
             last_summary=summary,
