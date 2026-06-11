@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import os
-import platform
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,7 +32,9 @@ from .store import Store
 from .task_spec import parse_task_spec
 
 
-settings = Settings.from_env()
+# Build settings. ``pydantic-settings`` already loads ``.env`` from the
+# current working directory, so Windows / macOS / Linux all "just work".
+settings = Settings()
 store = Store(settings.database_path)
 opencode = OpenCodeClient(
     settings.opencode_url,
@@ -46,7 +46,13 @@ status_stream = SessionStatusStream(
     settings.opencode_username,
     settings.opencode_password,
 )
-harness = HarnessRunner(store, opencode, settings.is_allowed_workspace)
+harness = HarnessRunner(
+    store,
+    opencode,
+    settings.is_allowed_workspace,
+    auto_decide=settings.opendeck_auto_decide,
+    auto_decide_max=settings.opendeck_auto_decide_max,
+)
 
 
 MESSAGE_BUSY_PROBE_WINDOW_SECONDS = 600
@@ -113,6 +119,45 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------------------------
+# Optional Basic Auth — for users that expose OpenDeck on a LAN/VPN.
+# ---------------------------------------------------------------------------
+if settings.basic_auth_enabled:
+    import secrets
+
+    @app.middleware("http")
+    async def _basic_auth_gate(request, call_next):
+        if request.url.path.startswith("/api"):
+            header = request.headers.get("authorization") or ""
+            if not header.lower().startswith("basic "):
+                return _basic_auth_unauthorized()
+            try:
+                import base64
+
+                decoded = base64.b64decode(header.split(" ", 1)[1]).decode("utf-8", "replace")
+                user, _, password = decoded.partition(":")
+            except Exception:
+                return _basic_auth_unauthorized()
+            user_ok = secrets.compare_digest(user, settings.opendeck_basic_auth_user)
+            pass_ok = secrets.compare_digest(password, settings.opendeck_basic_auth_pass)
+            if not (user_ok and pass_ok):
+                return _basic_auth_unauthorized()
+        return await call_next(request)
+
+
+def _basic_auth_unauthorized():
+    from fastapi.responses import Response
+
+    return Response(
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="OpenDeck"'},
+        content="Authentication required",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Request models.
+# ---------------------------------------------------------------------------
 class WorkspaceTarget(BaseModel):
     type: Literal["workspace"]
     cwd: str
@@ -124,6 +169,9 @@ class SessionTarget(BaseModel):
 
 
 class DispatchRequest(BaseModel):
+    """Legacy one-shot dispatch. Internally converted to a Harness task with
+    ``mode: ephemeral``."""
+
     target: WorkspaceTarget | SessionTarget
     agent: str = "opencode"
     mode: str = "normal"
@@ -131,14 +179,32 @@ class DispatchRequest(BaseModel):
 
 
 class HarnessTaskRequest(BaseModel):
+    """Unified task submission. ``workspace`` is required when ``sessionId``
+    is not provided. When ``sessionId`` is given, OpenDeck attaches the
+    harness to the existing session instead of creating a new one."""
+
     spec: str = Field(min_length=1)
     format: Literal["yaml", "markdown"] = "yaml"
+    session_id: str | None = Field(default=None, alias="sessionId")
+    bind: bool = Field(
+        default=False,
+        description=(
+            "When true and ``sessionId`` is set, attach the harness to the "
+            "existing session for periodic check-ins. Otherwise the session "
+            "is treated as a one-shot ephemeral task."
+        ),
+    )
+
+    model_config = {"populate_by_name": True}
 
 
 class PickFolderRequest(BaseModel):
     initial: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Helpers.
+# ---------------------------------------------------------------------------
 def _workspace_access_error() -> str:
     return (
         "Workspace is outside allowed roots"
@@ -188,6 +254,9 @@ def _status_counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Routes.
+# ---------------------------------------------------------------------------
 @app.get("/api/state")
 async def state() -> dict[str, Any]:
     health = await opencode.health()
@@ -273,9 +342,14 @@ async def state() -> dict[str, Any]:
         "server": {
             "ok": health.ok,
             "message": health.message,
-            "statusCode": health.status_code,
+            "status_code": health.status_code,
             "url": settings.opencode_url,
             "username": settings.opencode_username,
+        },
+        "config": {
+            "autoDecide": settings.opendeck_auto_decide,
+            "autoDecideMax": settings.opendeck_auto_decide_max,
+            "basicAuth": settings.basic_auth_enabled,
         },
         "recentWorkspaces": recent_workspaces,
         "tasks": tasks,
@@ -299,8 +373,16 @@ async def state() -> dict[str, Any]:
 
 @app.post("/api/dispatch")
 async def dispatch_message(request: DispatchRequest) -> dict[str, Any]:
+    """One-shot dispatch (legacy).
+
+    Translated into a unified Harness task with ``mode: ephemeral`` so the
+    Task and Harness code paths share the same execution engine.
+    """
+
     target = request.target
     title = _title_from_prompt(request.prompt)
+    session_id: str | None = None
+    cwd: str | None = None
 
     try:
         if target.type == "workspace":
@@ -318,10 +400,11 @@ async def dispatch_message(request: DispatchRequest) -> dict[str, Any]:
         else:
             session_id = target.sessionId
 
+        agent = None if request.agent == "opencode" else request.agent
         await opencode.send_prompt_async(
             session_id=session_id,
             prompt=request.prompt,
-            agent=None if request.agent == "opencode" else request.agent,
+            agent=agent,
         )
         return {
             "ok": True,
@@ -341,17 +424,35 @@ async def create_harness_task(request: HarnessTaskRequest) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Invalid task spec: {exc}") from exc
 
-    if not spec.workspace:
-        raise HTTPException(status_code=400, detail="Task spec must include workspace")
-    cwd = str(Path(spec.workspace).expanduser().resolve())
-    if not settings.is_allowed_workspace(cwd):
-        detail = (
-            "Workspace is outside allowed roots"
-            if settings.strict_roots
-            else "Workspace path does not exist or is not a directory"
-        )
-        raise HTTPException(status_code=400, detail=detail)
-    spec.workspace = cwd
+    session_id: str | None = request.session_id
+    bind = bool(request.bind) and bool(session_id)
+
+    # When attaching to an existing session we still want the spec to carry a
+    # workspace so the dashboard can show a path. Fall back to the session's
+    # directory, then to a synthetic value the user can ignore.
+    cwd: str | None = None
+    if session_id:
+        try:
+            sessions = await opencode.list_sessions()
+        except Exception:
+            sessions = []
+        match = next((s for s in sessions if s.get("id") == session_id), None)
+        if match and match.get("directory"):
+            cwd = str(Path(match["directory"]).expanduser().resolve())
+        if cwd is None:
+            cwd = spec.workspace or "(attached)"
+    else:
+        if not spec.workspace:
+            raise HTTPException(status_code=400, detail="Task spec must include workspace")
+        cwd = str(Path(spec.workspace).expanduser().resolve())
+        if not settings.is_allowed_workspace(cwd):
+            detail = (
+                "Workspace is outside allowed roots"
+                if settings.strict_roots
+                else "Workspace path does not exist or is not a directory"
+            )
+            raise HTTPException(status_code=400, detail=detail)
+        spec.workspace = cwd
 
     task_id = f"task_{uuid.uuid4().hex[:12]}"
     now = time.time()
@@ -362,20 +463,24 @@ async def create_harness_task(request: HarnessTaskRequest) -> dict[str, Any]:
         "spec_text": request.spec,
         "spec": spec.to_dict(),
         "workspace": cwd,
-        "mode": spec.mode,
+        "mode": "ephemeral" if (session_id and not bind) else spec.mode,
         "agent": spec.agent,
         "status": "pending",
         "check_interval_seconds": spec.check_interval_seconds,
         "next_check_at": now,
+        "active_session_id": session_id,
+        "bind_to_session": bind,
     }
     store.create_harness_task(task)
-    store.record_recent_workspace(cwd)
+    if not session_id and cwd and cwd != "(attached)":
+        store.record_recent_workspace(cwd)
 
     return {
         "ok": True,
         "taskId": task_id,
         "status": "pending",
         "name": spec.name,
+        "boundSessionId": session_id,
     }
 
 
@@ -505,7 +610,7 @@ async def hard_delete_session(session_id: str) -> dict[str, Any]:
 
 @app.post("/api/pick-folder")
 async def pick_folder(request: PickFolderRequest | None = None) -> dict[str, Any]:
-    if platform.system() not in {"Darwin", "Linux"}:
+    if platform.system() not in {"Darwin", "Linux"}:  # type: ignore[name-defined]
         return {"ok": False, "unsupported": True}
     initial = request.initial if request else None
     picked = await asyncio.to_thread(pick_folder_native, initial)
@@ -566,12 +671,20 @@ async def index(path: str = ""):
     }
 
 
-def main() -> None:
+# ---------------------------------------------------------------------------
+# Entry point. ``pydantic-settings`` loads ``.env`` automatically, so this
+# command works on Windows / macOS / Linux without any ``set -a`` dance.
+# ---------------------------------------------------------------------------
+def main() -> None:  # pragma: no cover
     import uvicorn
 
     uvicorn.run(
         "app.main:app",
-        host=os.getenv("OPENDECK_HOST", "127.0.0.1"),
-        port=int(os.getenv("OPENDECK_PORT", "55413")),
-        reload=True,
+        host=settings.opendeck_host,
+        port=settings.opendeck_port,
+        reload=False,
     )
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

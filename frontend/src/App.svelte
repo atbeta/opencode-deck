@@ -110,6 +110,7 @@
   let drawerError = $state('');
   let drawerMessages = $state([]);
   let drawerDiff = $state([]);
+  let drawerLoadedAt = $state(0);
 
   let archivedPopoverOpen = $state(false);
 
@@ -414,6 +415,12 @@
     drawerMessages = [];
     drawerDiff = [];
     drawerLoading = true;
+    await loadDrawerData(sessionId);
+  }
+
+  async function loadDrawerData(sessionId) {
+    drawerLoading = true;
+    drawerError = '';
     try {
       const [msgRes, diffRes] = await Promise.all([
         fetch(`/api/sessions/${sessionId}/messages`),
@@ -426,11 +433,17 @@
         const diffBody = await diffRes.json();
         drawerDiff = diffBody.diff || [];
       }
+      drawerLoadedAt = Date.now();
     } catch (err) {
       drawerError = err instanceof Error ? err.message : String(err);
     } finally {
       drawerLoading = false;
     }
+  }
+
+  async function refreshDrawer() {
+    if (!drawerSessionId) return;
+    await loadDrawerData(drawerSessionId);
   }
 
   function closeDrawer() {
@@ -503,24 +516,171 @@
     }
   }
 
-  function summarizeMessage(message) {
-    if (!message) return '';
-    const parts = message.parts || message.content || [];
-    if (Array.isArray(parts)) {
-      return parts
-        .map((part) => {
-          if (typeof part === 'string') return part;
-          return part.text || part.content || JSON.stringify(part);
-        })
-        .join('')
-        .slice(0, 220);
-    }
-    if (typeof message.text === 'string') return message.text.slice(0, 220);
-    return JSON.stringify(message).slice(0, 220);
+  function messageRole(message) {
+    const info = message?.info;
+    if (info && typeof info === 'object' && info.role) return String(info.role).toLowerCase();
+    return (message?.role || message?.type || 'message').toLowerCase();
   }
 
-  function messageRole(message) {
-    return (message?.role || message?.type || 'message').toLowerCase();
+  // Read a value from a nested object via a list of candidate keys.
+  function pickFirst(obj, keys, fallback = '') {
+    if (!obj || typeof obj !== 'object') return fallback;
+    for (const key of keys) {
+      const v = obj[key];
+      if (v !== undefined && v !== null && v !== '') return v;
+    }
+    return fallback;
+  }
+
+  function getMessageInfo(message) {
+    if (message?.info && typeof message.info === 'object') return message.info;
+    if (message?.metadata && typeof message.metadata === 'object') return message.metadata;
+    return null;
+  }
+
+  function getMessageParts(message) {
+    if (Array.isArray(message?.parts)) return message.parts;
+    if (Array.isArray(message?.content)) return message.content;
+    return [];
+  }
+
+  // Render a single part into a short, human-readable line. Mirrors the
+  // backend ``_summarize_part`` so the dashboard does not have to round-trip
+  // the raw JSON blob.
+  function renderPart(part) {
+    if (part == null) return null;
+    if (typeof part === 'string') {
+      const t = part.trim();
+      return t ? t : null;
+    }
+    if (typeof part !== 'object') return String(part);
+    const type = String(part.type || '').toLowerCase();
+    if (type === 'text' || type === '') {
+      const t = part.text || part.content;
+      if (typeof t === 'string' && t.trim()) return t.trim();
+      return null;
+    }
+    if (type === 'reasoning') {
+      const t = part.text || part.content || '';
+      const cleaned = typeof t === 'string' ? t.trim() : '';
+      return cleaned ? `💭 ${cleaned.slice(0, 200)}` : null;
+    }
+    if (type === 'tool' || type === 'tool_use' || type === 'tool-invocation') {
+      const name = part.name || part.tool || 'tool';
+      const args = part.input || part.args || part.arguments;
+      if (args && typeof args === 'object') {
+        for (const key of ['command', 'filePath', 'path', 'file', 'url', 'query', 'prompt']) {
+          const v = args[key];
+          if (typeof v === 'string' && v.trim()) {
+            return `🔧 ${name} — ${v.slice(0, 120)}`;
+          }
+        }
+        const summary = JSON.stringify(args);
+        if (summary && summary !== '{}') {
+          return `🔧 ${name} — ${summary.slice(0, 120)}`;
+        }
+      }
+      return `🔧 ${name}`;
+    }
+    if (type === 'tool_result' || type === 'tool-result') {
+      const name = part.name || part.tool || 'tool';
+      const output = part.output ?? part.content;
+      if (typeof output === 'string') {
+        const firstLine = output.split('\n').map((line) => line.trim()).find(Boolean);
+        return `↪ ${name}${firstLine ? `: ${firstLine.slice(0, 140)}` : ''}`;
+      }
+      return `↪ ${name}`;
+    }
+    if (type === 'step-start' || type === 'step-finish') return null;
+    // Unknown part type — show a one-line digest of its keys instead of the
+    // full JSON dump.
+    const keys = Object.keys(part).filter((k) => k !== 'type');
+    if (keys.length === 0) return null;
+    return `· ${type || 'part'} (${keys.slice(0, 3).join(', ')})`;
+  }
+
+  // Build the list of displayable lines for a single message. Empty
+  // lines are dropped; if the message has no displayable content at all
+  // we return a single placeholder so the user can still see the row.
+  function summarizeMessage(message) {
+    if (!message) return ['(empty)'];
+    if (typeof message.text === 'string' && message.text.trim()) {
+      return [message.text.trim()];
+    }
+    const parts = getMessageParts(message);
+    if (Array.isArray(parts) && parts.length > 0) {
+      const lines = parts.map(renderPart).filter(Boolean);
+      if (lines.length === 0) return ['(no displayable content)'];
+      if (lines.length > 5) {
+        return [...lines.slice(0, 5), `(+${lines.length - 5} more parts)`];
+      }
+      return lines;
+    }
+    // Last resort: digest the message itself instead of dumping JSON.
+    const info = getMessageInfo(message);
+    if (info) {
+      const role = pickFirst(info, ['role']);
+      const summary = pickFirst(info, ['summary', 'text', 'content']);
+      if (summary) return [String(summary).slice(0, 240)];
+      if (role) return [`(${role})`];
+    }
+    return ['(empty)'];
+  }
+
+  function messageTimestamp(message) {
+    const info = getMessageInfo(message);
+    const t = pickFirst(info, ['createdAt', 'created_at', 'time_created']);
+    if (typeof t === 'number' && t > 0) {
+      const ms = t > 1e12 ? t : t * 1000;
+      return new Date(ms).toLocaleTimeString();
+    }
+    return null;
+  }
+
+  function formatTimestamp(value) {
+    if (value === undefined || value === null || value === '') return '—';
+    if (typeof value === 'number' && value > 0) {
+      const ms = value > 1e12 ? value : value * 1000;
+      const d = new Date(ms);
+      if (Number.isNaN(d.getTime())) return String(value);
+      return d.toLocaleString();
+    }
+    return String(value);
+  }
+
+  function getTimeBlock(session) {
+    if (session?.time && typeof session.time === 'object') return session.time;
+    if (session?.timestamps && typeof session.timestamps === 'object') return session.timestamps;
+    return {};
+  }
+
+  function metaFields(session) {
+    if (!session) return {};
+    const t = getTimeBlock(session);
+    const fields = {
+      ID: session.id || '—',
+      Title: session.title || '—',
+      Slug: session.slug || '—',
+      Directory: session.directory || session.cwd || '—',
+      Parent: session.parentID || session.parentId || '— (root)',
+      Agent: session.agent || '—',
+      Mode: session.mode || '—',
+      Status: sessionStatus(session) || '—',
+      Created: formatTimestamp(t.created ?? session.created ?? session.createdAt),
+      Updated: formatTimestamp(t.updated ?? session.updated ?? session.updatedAt),
+      Archived: t.archived ? formatTimestamp(t.archived) : 'no',
+    };
+    // Token / cost summary when the session exposes them.
+    if (session.tokens && typeof session.tokens === 'object') {
+      const tok = session.tokens;
+      const parts = [];
+      for (const key of ['input', 'output', 'reasoning', 'cacheRead', 'cacheWrite']) {
+        if (typeof tok[key] === 'number') parts.push(`${key} ${tok[key].toLocaleString()}`);
+      }
+      if (parts.length) fields.Tokens = parts.join(' · ');
+    }
+    if (typeof session.cost === 'number') fields.Cost = `$${session.cost.toFixed(4)}`;
+    return fields;
   }
 
   async function refresh() {
@@ -1281,7 +1441,7 @@
   <div class="drawer-mask" onclick={closeDrawer} role="presentation"></div>
   <aside class="drawer" role="dialog" aria-label="Session detail">
     <header class="drawer-head">
-      <div>
+      <div class="drawer-head-main">
         <div class="drawer-eyebrow">Session</div>
         <h3>{drawerSession.title}</h3>
         <div class="mono drawer-dir">{shortPath(drawerSession.directory) || '(unknown directory)'}</div>
@@ -1295,9 +1455,29 @@
           {#if drawerSessionArchived}
             <span class="pill pill-fail" style="display: inline-flex; margin-left: 6px;"><span class="pill-dot"></span>archived</span>
           {/if}
+          <span class="dim drawer-loaded">
+            {#if drawerLoading}
+              loading…
+            {:else if drawerLoadedAt}
+              updated {Math.max(0, Math.floor((now - drawerLoadedAt) / 1000))}s ago
+            {/if}
+          </span>
         </div>
       </div>
-      <button class="btn btn-ghost btn-sm" type="button" onclick={closeDrawer}>Close</button>
+      <div class="drawer-head-actions">
+        <button
+          class="btn btn-ghost btn-sm drawer-refresh"
+          class:drawer-refresh-busy={drawerLoading}
+          type="button"
+          title="Refresh session data"
+          aria-label="Refresh session data"
+          onclick={refreshDrawer}
+          disabled={drawerLoading}
+        >
+          <span class="drawer-refresh-icon" aria-hidden="true">↻</span>
+        </button>
+        <button class="btn btn-ghost btn-sm" type="button" onclick={closeDrawer}>Close</button>
+      </div>
     </header>
 
     <div class="drawer-tabs">
@@ -1307,7 +1487,7 @@
     </div>
 
     <div class="drawer-body">
-      {#if drawerLoading}
+      {#if drawerLoading && drawerMessages.length === 0}
         <div class="empty">Loading…</div>
       {:else if drawerError}
         <div class="error">{drawerError}</div>
@@ -1317,9 +1497,18 @@
         {:else}
           <ol class="msg-list">
             {#each drawerMessages as message}
+              {@const ts = messageTimestamp(message)}
+              {@const lines = summarizeMessage(message)}
               <li class={`msg msg-${messageRole(message)}`}>
-                <div class="msg-meta mono">{messageRole(message)}</div>
-                <div class="msg-text">{summarizeMessage(message) || '(empty)'}</div>
+                <div class="msg-meta">
+                  <span class="mono msg-role">{messageRole(message)}</span>
+                  {#if ts}<span class="mono msg-ts">{ts}</span>{/if}
+                </div>
+                <div class="msg-body">
+                  {#each lines as line}
+                    <div class="msg-line">{line}</div>
+                  {/each}
+                </div>
               </li>
             {/each}
           </ol>
@@ -1330,15 +1519,39 @@
         {:else}
           <ul class="diff-list">
             {#each drawerDiff as file}
+              {@const filePath = file.file || file.path || file.filename || '(unnamed file)'}
+              {@const additions = file.additions ?? file.added ?? file.linesAdded}
+              {@const deletions = file.deletions ?? file.removed ?? file.linesRemoved}
               <li>
-                <div class="mono">{file.file || file.path || JSON.stringify(file)}</div>
-                <pre class="diff-block">{JSON.stringify(file, null, 2)}</pre>
+                <div class="diff-file-head">
+                  <span class="mono diff-file-path">{filePath}</span>
+                  <span class="diff-file-stats">
+                    {#if additions !== undefined && additions !== null}<span class="diff-add">+{additions}</span>{/if}
+                    {#if deletions !== undefined && deletions !== null}<span class="diff-del">-{deletions}</span>{/if}
+                  </span>
+                </div>
+                {#if file.patch || file.diff || file.hunks}
+                  <pre class="diff-block">{file.patch || file.diff}</pre>
+                {:else}
+                  <pre class="diff-block diff-block-meta">{JSON.stringify(file, null, 2)}</pre>
+                {/if}
               </li>
             {/each}
           </ul>
         {/if}
       {:else}
-        <pre class="payload-block">{JSON.stringify(drawerSession, null, 2)}</pre>
+        <div class="meta-grid">
+          {#each Object.entries(metaFields(drawerSession)) as [label, value]}
+            <div class="meta-row">
+              <div class="meta-label">{label}</div>
+              <div class="meta-value mono">{value}</div>
+            </div>
+          {/each}
+        </div>
+        <details class="meta-raw">
+          <summary>Raw JSON</summary>
+          <pre class="payload-block">{JSON.stringify(drawerSession, null, 2)}</pre>
+        </details>
       {/if}
     </div>
 

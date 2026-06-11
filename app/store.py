@@ -36,9 +36,11 @@ class Store:
                   current_step INTEGER NOT NULL DEFAULT 0,
                   session_ids_json TEXT NOT NULL DEFAULT '[]',
                   active_session_id TEXT,
+                  bind_to_session INTEGER NOT NULL DEFAULT 0,
                   check_interval_seconds INTEGER NOT NULL DEFAULT 30,
                   completed_steps_json TEXT NOT NULL DEFAULT '[]',
                   idle_checks INTEGER NOT NULL DEFAULT 0,
+                  auto_decide_count INTEGER NOT NULL DEFAULT 0,
                   progress REAL NOT NULL DEFAULT 0,
                   check_log_json TEXT NOT NULL DEFAULT '[]',
                   last_summary TEXT,
@@ -50,6 +52,7 @@ class Store:
                 )
                 """
             )
+            self._migrate_harness_tasks(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS recent_workspaces (
@@ -75,6 +78,22 @@ class Store:
         if row:
             conn.execute("DROP TABLE tasks")
 
+    @staticmethod
+    def _migrate_harness_tasks(conn: sqlite3.Connection) -> None:
+        """Add columns added in 0.2.0 to pre-existing databases."""
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(harness_tasks)").fetchall()
+        }
+        if "bind_to_session" not in existing:
+            conn.execute(
+                "ALTER TABLE harness_tasks ADD COLUMN bind_to_session INTEGER NOT NULL DEFAULT 0"
+            )
+        if "auto_decide_count" not in existing:
+            conn.execute(
+                "ALTER TABLE harness_tasks ADD COLUMN auto_decide_count INTEGER NOT NULL DEFAULT 0"
+            )
+
     def create_harness_task(self, task: dict[str, Any]) -> None:
         now = time.time()
         with self._connect() as conn:
@@ -82,11 +101,11 @@ class Store:
                 """
                 INSERT INTO harness_tasks (
                   id, name, spec_format, spec_text, spec_json, workspace, mode, agent,
-                  status, current_step, session_ids_json, active_session_id,
-                  check_interval_seconds, completed_steps_json, idle_checks, progress,
-                  check_log_json, last_summary, error, last_check_at, next_check_at,
-                  created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  status, current_step, session_ids_json, active_session_id, bind_to_session,
+                  check_interval_seconds, completed_steps_json, idle_checks,
+                  auto_decide_count, progress, check_log_json, last_summary, error,
+                  last_check_at, next_check_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task["id"],
@@ -101,9 +120,11 @@ class Store:
                     int(task.get("current_step") or 0),
                     json.dumps(task.get("session_ids") or [], ensure_ascii=False),
                     task.get("active_session_id"),
+                    1 if task.get("bind_to_session") else 0,
                     int(task.get("check_interval_seconds") or 30),
                     json.dumps(task.get("completed_steps") or [], ensure_ascii=False),
                     int(task.get("idle_checks") or 0),
+                    int(task.get("auto_decide_count") or 0),
                     float(task.get("progress") or 0),
                     json.dumps(task.get("check_log") or [], ensure_ascii=False),
                     task.get("last_summary"),
@@ -201,6 +222,11 @@ class Store:
         item["session_ids"] = json.loads(item.pop("session_ids_json") or "[]")
         item["completed_steps"] = json.loads(item.pop("completed_steps_json") or "[]")
         item["check_log"] = json.loads(item.pop("check_log_json") or "[]")
+        # Surface bind_to_session as a real bool for the frontend.
+        if "bind_to_session" in item:
+            item["bind_to_session"] = bool(item["bind_to_session"])
+        else:
+            item["bind_to_session"] = False
         return item
 
     @staticmethod

@@ -7,10 +7,13 @@ from .opencode_client import OpenCodeClient
 from .session_status import RETRY, messages_indicate_busy, normalize_session_status
 from .store import Store
 from .task_spec import (
+    _AUTO_DECISION_PROMPT,
     TaskSpec,
+    auto_decision_count,
     build_bootstrap_prompt,
     build_periodic_check_prompt,
     detect_progress_from_messages,
+    looks_like_asking,
     needs_continue_reply,
     summarize_messages,
 )
@@ -34,10 +37,20 @@ def session_is_idle(live: str, messages: list[dict[str, Any]]) -> bool:
 
 
 class HarnessRunner:
-    def __init__(self, store: Store, opencode: OpenCodeClient, allowed_workspace) -> None:
+    def __init__(
+        self,
+        store: Store,
+        opencode: OpenCodeClient,
+        allowed_workspace,
+        *,
+        auto_decide: bool = True,
+        auto_decide_max: int = 3,
+    ) -> None:
         self.store = store
         self.opencode = opencode
         self.allowed_workspace = allowed_workspace
+        self.auto_decide = auto_decide
+        self.auto_decide_max = max(0, int(auto_decide_max))
 
     async def tick(self) -> None:
         due = self.store.list_due_harness_tasks()
@@ -88,11 +101,25 @@ class HarnessRunner:
             raise ValueError("Task not found")
 
         spec = TaskSpec.from_dict(task["spec"])
-        if not self.allowed_workspace(spec.workspace):
-            raise ValueError("Workspace is outside allowed roots")
+        session_id = task.get("active_session_id")
+        bind = bool(task.get("bind_to_session"))
 
-        session = await self.opencode.create_session(cwd=spec.workspace, title=spec.name)
-        session_id = session["id"]
+        if not session_id:
+            if not self.allowed_workspace(spec.workspace):
+                raise ValueError("Workspace is outside allowed roots")
+            session = await self.opencode.create_session(cwd=spec.workspace, title=spec.name)
+            session_id = session["id"]
+        else:
+            # Verify the existing session is still visible.
+            try:
+                sessions = await self.opencode.list_sessions()
+            except Exception:
+                sessions = []
+            match = next((s for s in sessions if s.get("id") == session_id), None)
+            if not match:
+                raise ValueError(f"Session {session_id} no longer exists")
+            session_id = match["id"]
+
         prompt = build_bootstrap_prompt(spec, current_step=int(task.get("current_step") or 0))
         await self.opencode.send_prompt_async(
             session_id=session_id,
@@ -105,20 +132,33 @@ class HarnessRunner:
             session_ids.append(session_id)
 
         now = time.time()
+        # ``mode: ephemeral`` = one-shot, no further checks. ``continuous`` /
+        # ``normal`` schedules the next inspection.
+        mode = str(task.get("mode") or spec.mode or "normal").lower()
+        interval = 0 if mode == "ephemeral" else spec.check_interval_seconds
+        next_check = now + interval if interval > 0 else None
+
+        summary = (
+            f"Harness attached to existing session {session_id}"
+            if bind
+            else "Harness started and bootstrap prompt sent"
+        )
+        detail = f"session={session_id}; mode={mode}; bind={bind}"
+
         self.store.update_harness_task(
             task_id,
             status="running",
             active_session_id=session_id,
             session_ids=session_ids,
             last_check_at=now,
-            next_check_at=now + spec.check_interval_seconds,
+            next_check_at=next_check,
             error=None,
         )
         self.store.append_harness_check(
             task_id,
             status="running",
-            summary="Harness started and bootstrap prompt sent",
-            detail=f"session={session_id}",
+            summary=summary,
+            detail=detail,
         )
 
     async def _check_task(
@@ -131,8 +171,12 @@ class HarnessRunner:
     ) -> None:
         task_id = task["id"]
         spec = TaskSpec.from_dict(task["spec"])
+        mode = str(task.get("mode") or spec.mode or "normal").lower()
         now = time.time()
-        interval = int(task.get("check_interval_seconds") or spec.check_interval_seconds or 30)
+        # Ephemeral (one-shot) tasks get a single nudge then retire. Other
+        # modes use the spec-defined interval.
+        base_interval = int(task.get("check_interval_seconds") or spec.check_interval_seconds or 30)
+        interval = 0 if mode == "ephemeral" else base_interval
 
         if task.get("status") == "pending":
             await self.start_task(task_id)
@@ -173,6 +217,7 @@ class HarnessRunner:
         is_idle = session_is_idle(live, messages)
         completed_steps = list(task.get("completed_steps") or [])
         agent_name = None if spec.agent == "opencode" else spec.agent
+        ask_count = int(task.get("auto_decide_count") or 0)
 
         current_step = int(task.get("current_step") or 0)
         if progress["step_done"] > 0:
@@ -188,8 +233,30 @@ class HarnessRunner:
             spec.acceptance and progress["acceptance_checked"] >= len(spec.acceptance)
         ) or all_steps_reported
 
+        # Detect whether the latest assistant turn is asking a question.
+        last_assistant_text = ""
+        for message in reversed(messages):
+            if message.get("role") in {"assistant", "agent"} or (
+                isinstance(message.get("info"), dict)
+                and message["info"].get("role") in {"assistant", "agent"}
+            ):
+                # Reuse the helper from task_spec but inline to avoid an
+                # extra import path.
+                from .task_spec import _message_text
+
+                last_assistant_text = _message_text(message)
+                break
+        agent_is_asking = is_idle and looks_like_asking(last_assistant_text)
+        already_auto_decided = (
+            agent_is_asking
+            and self.auto_decide
+            and auto_decision_count(messages) > ask_count
+        )
+
         status = "running"
         summary = "Agent is busy"
+        nudge: str | None = None
+
         if messages_indicate_busy(messages):
             status = "running"
             summary = "Agent is busy"
@@ -206,10 +273,24 @@ class HarnessRunner:
                 if progress["task_complete"]
                 else "All harness steps appear complete"
             )
+        elif agent_is_asking and self.auto_decide and not already_auto_decided:
+            if ask_count >= self.auto_decide_max:
+                status = "waiting"
+                summary = (
+                    f"Agent keeps asking — auto-decide cap reached "
+                    f"({self.auto_decide_max}). Waiting for human input."
+                )
+            else:
+                nudge = _AUTO_DECISION_PROMPT
+                status = "running"
+                summary = (
+                    f"Agent asked a question — auto-deciding "
+                    f"({ask_count + 1}/{self.auto_decide_max})"
+                )
+                ask_count += 1
         elif is_idle:
             status = "running"
             summary = "Session idle — verifying progress"
-            nudge: str | None = None
             if needs_continue_reply(messages):
                 step_name = spec.steps[min(current_step, len(spec.steps) - 1)]
                 nudge = (
@@ -233,6 +314,11 @@ class HarnessRunner:
                 )
                 current_step = next_index
                 summary = f"Nudged agent toward step {next_index + 1}"
+            elif mode == "ephemeral":
+                # One-shot mode: we sent the prompt, gave the agent a chance
+                # to reply, and now we retire the task.
+                status = "completed"
+                summary = "Ephemeral task delivered"
             else:
                 nudge = build_periodic_check_prompt(
                     spec,
@@ -265,7 +351,17 @@ class HarnessRunner:
         else:
             idle_checks = 0
 
-        next_check = None if status in {"completed", "failed", "archived"} else now + interval
+        # Ephemeral tasks stop scheduling the next check after the first
+        # inspection cycle. Other modes continue.
+        if mode == "ephemeral" and status in {"completed", "failed", "archived"}:
+            next_check_at: float | None = None
+        elif status in {"completed", "failed", "archived"}:
+            next_check_at = None
+        elif interval > 0:
+            next_check_at = now + interval
+        else:
+            next_check_at = now + base_interval
+
         self.store.update_harness_task(
             task_id,
             status=status,
@@ -274,8 +370,9 @@ class HarnessRunner:
             idle_checks=idle_checks,
             progress=step_progress,
             last_check_at=now,
-            next_check_at=next_check,
+            next_check_at=next_check_at,
             last_summary=summary,
+            auto_decide_count=ask_count,
         )
         self.store.append_harness_check(
             task_id,

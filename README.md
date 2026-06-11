@@ -64,15 +64,13 @@ opencode serve --hostname 127.0.0.1 --port 14096
 
 ### 4. 启动 OpenDeck
 
-```bash
-set -a
-source .env
-set +a
+`.env` 由 `pydantic-settings` 自动加载，**macOS / Linux / Windows 都一样**——不需要 `set -a` 也不需要 `source`。
 
-uvicorn app.main:app --host "${OPENDECK_HOST:-127.0.0.1}" --port "${OPENDECK_PORT:-55413}"
+```bash
+uvicorn app.main:app --host 127.0.0.1 --port 55413
 ```
 
-或使用入口命令（开发模式默认 `--reload`）：
+或使用入口命令：
 
 ```bash
 opendeck
@@ -94,6 +92,9 @@ opendeck
 | `OPENDECK_DATABASE` | SQLite 路径（Harness、Recent Workspaces） | `.opendeck/opendeck.sqlite3` |
 | `OPENDECK_ALLOWED_ROOTS` | 允许的工作区根目录，冒号分隔 | 空（不限制） |
 | `OPENDECK_STRICT_ROOTS` | 设为 `true` 时强制白名单 | `false` |
+| `OPENDECK_BASIC_AUTH_USER` / `OPENDECK_BASIC_AUTH_PASS` | Dashboard HTTP Basic Auth（两个都填才生效） | 空（关闭） |
+| `OPENDECK_AUTO_DECIDE` | Harness 检测到 Agent 在问选方案时自动回复 | `true` |
+| `OPENDECK_AUTO_DECIDE_MAX` | 单个 session 最多自动决定几次（超出后转 `waiting`） | `3` |
 
 凭据只通过环境变量注入，不要写入代码或提交到 git。
 
@@ -104,7 +105,6 @@ opendeck
 ```bash
 # 终端 1：后端
 source .venv/bin/activate
-set -a && source .env && set +a
 uvicorn app.main:app --host 127.0.0.1 --port 55413 --reload
 
 # 终端 2：前端
@@ -239,6 +239,28 @@ curl -s -u "$OPENCODE_SERVER_USERNAME:$OPENCODE_SERVER_PASSWORD" \
 | 仅限制能派发哪些目录 | 配置 `OPENDECK_ALLOWED_ROOTS`（与 OpenCode 权限无关） |
 
 当前版本**未实现** OpenDeck 自动代批权限；若未来增加，会以独立环境变量开关并提供审计日志。
+
+## 无人值守 / Auto-decision
+
+Harness 在发 bootstrap 和后续巡检 prompt 时，会自动注入一段 `OPENDEPLOY EXECUTION POLICY`，让 Agent 明确知道自己**没人在旁边**——遇到歧义就挑合理默认、遇到 tool 权限直接执行、`STEP DONE: <n>` 推进进度。
+
+如果 Agent 仍然选了提问（"should I do X or Y?"），Harness 会检测到并代发一条 `auto-decision` 提示，让 Agent 自己挑最保守的方案继续跑。默认 `OPENDECK_AUTO_DECIDE_MAX=3`，超过后任务状态会切到 `waiting` 并停止继续代答，避免 Agent 进入 “问 → 答 → 再问” 的死循环。
+
+## 绑定到已有 session
+
+`POST /api/tasks` 现在支持 `sessionId` + `bind: true`：
+
+```json
+{
+  "format": "yaml",
+  "spec": "name: ...",
+  "sessionId": "ses_xxx",
+  "bind": true
+}
+```
+
+绑定后 Harness 会接管这个 session、按现有间隔巡检并能推 STEP DONE / TASK COMPLETE。需要一次性的派发时把 `bind` 留空（默认 `false`），任务以 `mode: ephemeral` 落到 store 里，但不再起后续轮询——这相当于老 `POST /api/dispatch` 跟 `POST /api/tasks` 合并后的统一入口。
+
 
 ## 分发与部署
 

@@ -7,6 +7,27 @@ from typing import Any
 import yaml
 
 
+# ---------------------------------------------------------------------------
+# Unattended-execution policy. This block is prepended to every prompt the
+# Harness sends to an Agent, so even if the spec author forgets to add
+# constraints the agent still knows it is running headless.
+# ---------------------------------------------------------------------------
+UNATTENDED_POLICY = """[OPENDEPLOY EXECUTION POLICY — NON-NEGOTIABLE]
+You are running an OpenDeck harness task WITHOUT a human at the keyboard.
+- If you encounter ambiguity, PICK A REASONABLE DEFAULT and document the
+  choice in your STEP DONE summary. Do NOT ask the user to choose between
+  options.
+- Tool permissions for the workspace owner have been pre-approved. Do not
+  request approval for read / edit / bash inside this workspace — proceed
+  directly. If you genuinely need input that cannot be inferred (e.g. a
+  destructive production operation), emit `BLOCKED: <reason>` and stop.
+- After every meaningful step, emit exactly one line: `STEP DONE: <n>`.
+- When all acceptance criteria are satisfied, emit: `TASK COMPLETE`.
+- If a step requires no changes, still emit `STEP DONE: <n>` to confirm.
+- Do NOT propose plans and ask for approval. Implement, then report.
+"""
+
+
 @dataclass
 class TaskSpec:
     name: str
@@ -164,13 +185,24 @@ def _parse_markdown(text: str) -> TaskSpec:
 
 def build_bootstrap_prompt(spec: TaskSpec, *, current_step: int = 0) -> str:
     if spec.initial_prompt:
-        return spec.initial_prompt
+        return f"{UNATTENDED_POLICY}\n\n{spec.initial_prompt}"
 
-    steps_block = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(spec.steps)) or "1. Complete the goal"
-    acceptance_block = "\n".join(f"- [ ] {item}" for item in spec.acceptance) or "- [ ] Goal achieved"
-    step_name = spec.steps[current_step] if 0 <= current_step < len(spec.steps) else "Finish remaining work"
+    steps_block = (
+        "\n".join(f"{i + 1}. {step}" for i, step in enumerate(spec.steps))
+        or "1. Complete the goal"
+    )
+    acceptance_block = (
+        "\n".join(f"- [ ] {item}" for item in spec.acceptance) or "- [ ] Goal achieved"
+    )
+    step_name = (
+        spec.steps[current_step]
+        if 0 <= current_step < len(spec.steps)
+        else "Finish remaining work"
+    )
 
-    return f"""You are executing an OpenDeck harness task.
+    return f"""{UNATTENDED_POLICY}
+
+You are executing an OpenDeck harness task.
 
 Task: {spec.name}
 Workspace: {spec.workspace}
@@ -187,7 +219,6 @@ Acceptance criteria:
 Current focus: step {current_step + 1} — {step_name}
 
 Proceed through steps autonomously. Do not ask for confirmation between steps.
-
 When you complete a step, include a line: STEP DONE: <number>
 When all acceptance criteria are satisfied, include a line: TASK COMPLETE
 """
@@ -201,6 +232,13 @@ def message_role(message: dict[str, Any]) -> str:
 
 
 def _message_text(message: dict[str, Any]) -> str:
+    """Concatenate the human-readable text from a message.
+
+    Tools and reasoning parts are intentionally skipped — they bloat the
+    transcript and confuse the progress detection heuristics. The full
+    structure is still available via the API; the spec extractor only needs
+    the parts an Agent would actually print to a human user.
+    """
     if isinstance(message.get("text"), str):
         return message["text"]
     parts = message.get("parts") or message.get("content") or []
@@ -208,11 +246,87 @@ def _message_text(message: dict[str, Any]) -> str:
         return ""
     out: list[str] = []
     for part in parts:
-        if isinstance(part, str):
-            out.append(part)
-        elif isinstance(part, dict):
-            out.append(str(part.get("text") or part.get("content") or ""))
+        if not isinstance(part, dict):
+            if isinstance(part, str):
+                out.append(part)
+            continue
+        part_type = str(part.get("type") or "").lower()
+        # Skip noisy / non-readable parts.
+        if part_type in {"tool", "tool_use", "tool_result", "reasoning", "step-start", "step-finish"}:
+            continue
+        text = part.get("text") or part.get("content")
+        if isinstance(text, str) and text:
+            out.append(text)
     return "".join(out)
+
+
+def _summarize_part(part: Any) -> str | None:
+    """Compress a single message part into a short, human-readable label.
+
+    Used by the dashboard message list. The goal is "one line per meaningful
+    event" — not a faithful JSON dump.
+    """
+    if isinstance(part, str):
+        return part.strip() or None
+    if not isinstance(part, dict):
+        return None
+    part_type = str(part.get("type") or "").lower()
+    if part_type in {"text", ""}:
+        text = part.get("text") or part.get("content")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        return None
+    if part_type in {"reasoning"}:
+        text = part.get("text") or part.get("content") or ""
+        if isinstance(text, str) and text.strip():
+            return f"💭 {text.strip()[:160]}"
+        return None
+    if part_type in {"tool", "tool_use", "tool-invocation"}:
+        name = part.get("name") or part.get("tool") or "tool"
+        args = part.get("input") or part.get("args") or part.get("arguments")
+        if isinstance(args, dict):
+            # Pick the first non-empty string/short value as a hint.
+            hint = ""
+            for key in ("command", "filePath", "path", "file", "url", "query", "prompt"):
+                v = args.get(key)
+                if isinstance(v, str) and v.strip():
+                    hint = v.strip()
+                    break
+            if hint:
+                return f"🔧 {name} — {hint[:80]}"
+        return f"🔧 {name}"
+    if part_type in {"tool_result", "tool-result"}:
+        name = part.get("name") or part.get("tool") or "tool"
+        output = part.get("output") or part.get("content")
+        if isinstance(output, str):
+            return f"↪ {name}: {output.strip().splitlines()[0][:120]}"
+        return f"↪ {name}"
+    if part_type in {"step-start", "step-finish"}:
+        return None
+    return None
+
+
+def summarize_message(message: dict[str, Any], *, max_parts: int = 4) -> str:
+    """Render a message as a list of short human-readable lines.
+
+    Each part becomes one line; if there are too many parts we keep the first
+    N and summarize the rest as "(+M more parts)". Empty parts are dropped.
+    """
+    parts = message.get("parts") or message.get("content") or []
+    if not isinstance(parts, list):
+        if isinstance(message.get("text"), str):
+            return message["text"]
+        return ""
+    lines: list[str] = []
+    for part in parts:
+        rendered = _summarize_part(part)
+        if rendered:
+            lines.append(rendered)
+    if len(lines) > max_parts:
+        kept = lines[:max_parts]
+        kept.append(f"(+{len(lines) - max_parts} more parts)")
+        return "\n".join(kept)
+    return "\n".join(lines)
 
 
 def full_transcript(messages: list[dict[str, Any]], limit: int = 12) -> str:
@@ -234,21 +348,70 @@ def summarize_messages(messages: list[dict[str, Any]], limit: int = 6) -> str:
     return "\n".join(chunks)
 
 
-_CONTINUE_PATTERNS = (
+# ---------------------------------------------------------------------------
+# Asking-detection. When the Agent responds with "should I do X or Y?" we
+# classify the question so the Harness can auto-decide instead of stalling.
+# ---------------------------------------------------------------------------
+_ASKING_PATTERNS = (
     "should i proceed",
     "should i continue",
     "want me to proceed",
     "want me to continue",
     "shall i proceed",
+    "shall i continue",
     "ready for step",
     "may i proceed",
     "do you want me to",
+    "would you like",
+    "which approach",
+    "which option",
+    "which one should",
+    "let me know if",
+    "please confirm",
+    "please choose",
+    "please decide",
 )
 
 
-def agent_awaiting_continue(text: str) -> bool:
+def looks_like_asking(text: str) -> bool:
+    """True if the assistant appears to be asking the user a question."""
+    if not text:
+        return False
     lower = text.lower()
-    return any(pattern in lower for pattern in _CONTINUE_PATTERNS)
+    if "?" not in lower:
+        return False
+    return any(pattern in lower for pattern in _ASKING_PATTERNS)
+
+
+_AUTO_DECISION_PROMPT = (
+    "The previous turn asked a question, but OpenDeck runs unattended. "
+    "Pick the safest interpretation (smallest blast radius, follows existing "
+    "conventions, least invasive change) and proceed. "
+    "Do not ask again. Emit STEP DONE: <n> or TASK COMPLETE when done."
+)
+
+
+def auto_decision_count(messages: list[dict[str, Any]]) -> int:
+    """How many auto-decision prompts we have already sent in this session.
+
+    Used to avoid an infinite ping-pong if the Agent keeps asking.
+    """
+    count = 0
+    for message in messages:
+        if message_role(message) != "user":
+            continue
+        text = _message_text(message)
+        if text and _AUTO_DECISION_PROMPT[:40] in text:
+            count += 1
+    return count
+
+
+# Kept for backwards compatibility — older code referenced these names.
+_CONTINUE_PATTERNS = _ASKING_PATTERNS
+
+
+def agent_awaiting_continue(text: str) -> bool:
+    return looks_like_asking(text)
 
 
 def needs_continue_reply(messages: list[dict[str, Any]]) -> bool:
@@ -296,7 +459,9 @@ def build_periodic_check_prompt(
     focus_index = min(current_step, len(spec.steps) - 1) if spec.steps else 0
     focus_step = spec.steps[focus_index] if spec.steps else "Finish remaining work"
 
-    return f"""OpenDeck harness periodic check for "{spec.name}".
+    return f"""{UNATTENDED_POLICY}
+
+OpenDeck harness periodic check for "{spec.name}".
 
 The session is idle. Confirm task status before we schedule the next check.
 
