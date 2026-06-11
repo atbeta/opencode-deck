@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     )
 
     opencode_server_url: str = Field(default="http://127.0.0.1:14096")
-    opencode_server_username: str = Field(default="opencode")
+    opencode_server_username: str = Field(default="")
     opencode_server_password: str = Field(default="")
 
     opendeck_host: str = Field(default="127.0.0.1")

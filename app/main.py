@@ -35,6 +35,16 @@ from .task_spec import parse_task_spec
 # Build settings. ``pydantic-settings`` already loads ``.env`` from the
 # current working directory, so Windows / macOS / Linux all "just work".
 settings = Settings()
+
+if not settings.opencode_username or not settings.opencode_password:
+    import sys
+
+    print(
+        "[opendeck] WARNING: OPENCODE_SERVER_USERNAME / OPENCODE_SERVER_PASSWORD "
+        "are not set. The dashboard will not be able to talk to opencode serve "
+        "until you fill them in .env. See .env.example for details.",
+        file=sys.stderr,
+    )
 store = Store(settings.database_path)
 opencode = OpenCodeClient(
     settings.opencode_url,
@@ -367,7 +377,8 @@ async def state() -> dict[str, Any]:
             "message": health.message,
             "status_code": health.status_code,
             "url": settings.opencode_url,
-            "username": settings.opencode_username,
+            "username": settings.opencode_username or None,
+            "configured": bool(settings.opencode_username and settings.opencode_password),
         },
         "config": {
             "autoDecide": settings.opendeck_auto_decide,
