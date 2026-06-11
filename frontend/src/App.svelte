@@ -906,7 +906,10 @@
       const value = String(typeof status === 'string' ? status : status?.type || status?.status || '').toLowerCase();
       return value === 'busy' || value === 'retry' || value.includes('running') || value.includes('wait');
     });
-    return hasActive ? 2000 : 5000;
+    // SSE covers real-time status changes, so the slow /api/state poll
+    // only needs to catch new sessions and task updates. Slow it down to
+    // avoid hammering the upstream OpenCode server.
+    return hasActive ? 5000 : 15000;
   }
 
   onMount(() => {

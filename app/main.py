@@ -57,6 +57,10 @@ harness = HarnessRunner(
 
 MESSAGE_BUSY_PROBE_WINDOW_SECONDS = 600
 MESSAGE_BUSY_PROBE_LIMIT = 12
+# Cache per-session busy probes for a short window so that the dashboard's
+# 5-second poll does not fan out N HTTP messages calls every refresh.
+_PROBE_CACHE_TTL_SECONDS = 8.0
+_probe_cache: dict[str, tuple[float, bool]] = {}
 
 
 async def _probe_message_busy_sessions(
@@ -73,6 +77,21 @@ async def _probe_message_busy_sessions(
     candidates.sort(key=session_updated_at, reverse=True)
     candidates = candidates[:MESSAGE_BUSY_PROBE_LIMIT]
 
+    # Evict stale entries.
+    stale = [sid for sid, (ts, _) in _probe_cache.items() if now - ts > _PROBE_CACHE_TTL_SECONDS * 4]
+    for sid in stale:
+        _probe_cache.pop(sid, None)
+
+    cached: dict[str, bool] = {}
+    todo: list[dict[str, Any]] = []
+    for session in candidates:
+        sid = session["id"]
+        hit = _probe_cache.get(sid)
+        if hit and now - hit[0] < _PROBE_CACHE_TTL_SECONDS:
+            cached[sid] = hit[1]
+        else:
+            todo.append(session)
+
     async def probe(session: dict[str, Any]) -> tuple[str, bool]:
         session_id = session["id"]
         try:
@@ -81,8 +100,12 @@ async def _probe_message_busy_sessions(
             return session_id, False
         return session_id, messages_indicate_busy(messages)
 
-    results = await asyncio.gather(*(probe(session) for session in candidates))
-    return dict(results)
+    if todo:
+        results = await asyncio.gather(*(probe(session) for session in todo))
+        for sid, busy in results:
+            _probe_cache[sid] = (now, busy)
+            cached[sid] = busy
+    return cached
 
 
 async def _harness_loop() -> None:

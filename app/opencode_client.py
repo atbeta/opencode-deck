@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
 
 from .session_status import BUSY, RETRY, extract_status_type
+
+
+PROJECT_CACHE_TTL_SECONDS = 10.0
 
 
 class OpenCodeError(Exception):
@@ -69,6 +74,13 @@ class OpenCodeClient:
     def __init__(self, base_url: str, username: str, password: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.auth = (username, password)
+        # Cache ``/project`` responses for a few seconds. ``/api/state`` is
+        # polled by the dashboard every ~5s and the upstream endpoint walks
+        # the local SQLite, so caching prevents the same fan-out from
+        # blocking every refresh.
+        self._project_cache: list[dict[str, Any]] | None = None
+        self._project_cache_at: float = 0.0
+        self._project_lock = asyncio.Lock()
 
     async def health(self) -> OpenCodeHealth:
         try:
@@ -82,34 +94,43 @@ class OpenCodeClient:
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         try:
-            projects = await self._request_json("GET", "/project")
+            projects = await self._get_projects()
         except Exception:
             return await self._list_sessions_default()
 
-        if not isinstance(projects, list):
+        if not isinstance(projects, list) or not projects:
             return await self._list_sessions_default()
 
+        # Fan out per-worktree requests in parallel. Earlier versions did this
+        # serially, which made /api/state take 4-6s with several workspaces.
         seen: set[str] = set()
         result: list[dict[str, Any]] = []
+        targets: list[dict[str, str]] = []
         for project in projects:
             if not isinstance(project, dict):
                 continue
             worktree = project.get("worktree") or ""
-            params = {}
+            params: dict[str, str] = {"limit": "500"}
             if worktree and worktree != "/":
                 params["directory"] = worktree
-            params["limit"] = 500
+            targets.append(params)
+
+        async def fetch_one(params: dict[str, str]) -> list[dict[str, Any]]:
             try:
                 data = await self._request_json("GET", "/session", params=params)
             except Exception:
-                continue
-            for item in self._extract_sessions(data):
-                sid = item.get("id")
+                return []
+            return [self._normalize_session(item) for item in self._extract_sessions(data)]
+
+        per_project = await asyncio.gather(*(fetch_one(p) for p in targets))
+        for items in per_project:
+            for session in items:
+                sid = session.get("id")
                 if sid and sid in seen:
                     continue
                 if sid:
                     seen.add(sid)
-                result.append(self._normalize_session(item))
+                result.append(session)
         return result
 
     async def _list_sessions_default(self) -> list[dict[str, Any]]:
@@ -128,31 +149,72 @@ class OpenCodeClient:
 
     async def session_status(self) -> dict[str, Any]:
         merged: dict[str, Any] = {}
-        with contextlib.suppress(Exception):
-            _absorb_status_map(merged, await self._request_json("GET", "/session/status"))
+        merge_lock = asyncio.Lock()
+
+        async def absorb(payload: Any) -> None:
+            # ``_absorb_status_map`` is a read-modify-write on ``merged``;
+            # serialise the writes so a higher-priority entry from a
+            # per-worktree fetch cannot be clobbered by a stale global
+            # entry.
+            async with merge_lock:
+                _absorb_status_map(merged, payload)
 
         try:
-            projects = await self._request_json("GET", "/project")
+            projects = await self._get_projects()
         except Exception:
-            return merged
+            projects = None
 
-        if not isinstance(projects, list):
-            return merged
+        async def global_status() -> None:
+            try:
+                payload = await self._request_json("GET", "/session/status")
+            except Exception:
+                return
+            await absorb(payload)
 
-        for project in projects:
-            if not isinstance(project, dict):
-                continue
-            worktree = project.get("worktree") or ""
-            params: dict[str, Any] = {}
-            if worktree and worktree != "/":
-                params["directory"] = worktree
-            with contextlib.suppress(Exception):
-                _absorb_status_map(
-                    merged,
-                    await self._request_json("GET", "/session/status", params=params or None),
-                )
+        async def per_worktree_status() -> None:
+            if not isinstance(projects, list) or not projects:
+                return
 
+            async def fetch(project: dict[str, Any]) -> Any:
+                worktree = project.get("worktree") or ""
+                params: dict[str, Any] = {"limit": "500"}
+                if worktree and worktree != "/":
+                    params["directory"] = worktree
+                try:
+                    return await self._request_json(
+                        "GET", "/session/status", params=params
+                    )
+                except Exception:
+                    return None
+
+            payloads = await asyncio.gather(*(fetch(p) for p in projects))
+            for payload in payloads:
+                if payload is not None:
+                    await absorb(payload)
+
+        await asyncio.gather(global_status(), per_worktree_status())
         return merged
+
+    async def _get_projects(self) -> list[Any]:
+        """Cached wrapper around ``GET /project`` used by session lists and
+        status maps. Falls back to a one-shot direct call on cache miss.
+        """
+        now = time.monotonic()
+        if self._project_cache is not None and now - self._project_cache_at < PROJECT_CACHE_TTL_SECONDS:
+            return self._project_cache
+        async with self._project_lock:
+            now = time.monotonic()
+            if self._project_cache is not None and now - self._project_cache_at < PROJECT_CACHE_TTL_SECONDS:
+                return self._project_cache
+            try:
+                data = await self._request_json("GET", "/project")
+            except Exception:
+                return self._project_cache or []
+            if not isinstance(data, list):
+                return self._project_cache or []
+            self._project_cache = [p for p in data if isinstance(p, dict)]
+            self._project_cache_at = time.monotonic()
+            return self._project_cache
 
     async def create_session(self, cwd: str, title: str | None = None) -> dict[str, Any]:
         query = urlencode({"directory": cwd})
